@@ -3,49 +3,162 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+    <title>OMA | ZSA Oryx to MoErgo Migration Assistant</title>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace']
+                    }
+                }
+            }
         }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+    </script>
+    <style type="text/tailwindcss">
+        @layer base { 
+            body { @apply bg-slate-50 text-slate-700 font-sans min-h-screen selection:bg-blue-500/20; } 
         }
-        
-        .container {
-            text-align: center;
-            background: white;
-            padding: 40px;
-            border-radius: 10px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-            max-width: 600px;
-        }
-        
-        h1 {
-            color: #333;
-            margin-bottom: 20px;
-            font-size: 2.5em;
-        }
-        
-        p {
-            color: #666;
-            font-size: 1.1em;
-            line-height: 1.6;
+        @layer components {
+            /* Core Layout */
+            .glass-panel { @apply bg-white border border-slate-200 rounded-3xl p-6 sm:p-10 shadow-[0_4px_20px_rgba(0,0,0,0.03)]; }
+            .drop-zone { @apply border-2 border-dashed border-slate-300 bg-slate-50/50 rounded-2xl p-12 text-center cursor-pointer transition-all duration-300 ease-out hover:border-blue-400 hover:bg-blue-50/50 hover:-translate-y-1 hover:shadow-[0_8px_20px_rgba(59,130,246,0.08)]; }
+            .drop-zone.dragover { @apply border-blue-500 bg-blue-50 shadow-[inset_0_0_20px_rgba(59,130,246,0.05)]; }
+            .btn-primary { @apply bg-blue-600 text-white font-semibold py-3.5 px-8 rounded-xl shadow-[0_2px_4px_rgba(0,0,0,0.05)] hover:bg-blue-700 hover:-translate-y-px transition-all flex items-center justify-center gap-2 text-sm active:translate-y-[1px] cursor-pointer; }
+            .btn-secondary { @apply bg-white border border-slate-200 text-slate-700 font-semibold py-3.5 px-8 rounded-xl shadow-[0_1px_2px_rgba(0,0,0,0.02)] hover:bg-slate-50 hover:border-slate-300 hover:-translate-y-px transition-all flex items-center justify-center gap-2 text-sm active:translate-y-[1px] cursor-pointer; }
+            
+            /* Checklist UI */
+            .checklist-container { @apply flex flex-col bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm; }
+            .checklist-item { @apply flex items-start gap-4 p-5 border-b border-slate-100 last:border-0 bg-white; }
+            .step-circle { @apply w-8 h-8 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center font-bold text-sm shrink-0 border border-blue-200; }
+            .step-circle-warn { @apply bg-orange-100 text-orange-600 border-orange-200; }
+
+            /* Stats Grid */
+            .stat-grid { @apply grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8; }
+            .stat-box { @apply bg-white border border-slate-200 p-5 rounded-2xl flex flex-col items-center justify-center shadow-sm transition-transform hover:-translate-y-1; }
+            .stat-box.warning { @apply border-orange-200 bg-orange-50/50; }
+            .stat-num { @apply text-3xl font-black text-slate-800 tracking-tight mb-1; }
+            .stat-label { @apply text-[11px] font-bold text-slate-500 uppercase tracking-wider; }
+
+            /* Accordion Categories */
+            .report-category { @apply bg-white border border-slate-200 rounded-2xl shadow-sm mb-4 overflow-hidden [&[open]>summary]:border-b [&[open]>summary]:border-slate-100 [&[open]>summary]:bg-slate-50/50; }
+            .report-category summary { @apply p-5 flex items-center font-bold text-slate-700 text-sm cursor-pointer list-none outline-none hover:bg-slate-50 transition-colors select-none; }
+            .report-category summary::-webkit-details-marker { @apply hidden; }
+            .cat-content { @apply bg-white overflow-x-auto; }
+            
+            /* Tables */
+            table { @apply w-full text-left border-collapse; }
+            th { @apply px-5 py-3 bg-slate-50 border-y border-slate-100 text-[11px] font-bold text-slate-500 uppercase tracking-wider whitespace-nowrap; }
+            td { @apply px-5 py-3 border-b border-slate-100 align-middle text-sm text-slate-700; }
+            td.code { @apply w-[1%] whitespace-nowrap; }
+            td.reason { @apply text-[13px] text-slate-600; }
+            
+            /* Keycaps */
+            .keycap { @apply inline-flex items-center justify-center px-2 py-1 bg-white border border-slate-300 rounded-md text-[11px] font-mono font-bold text-slate-700 shadow-[0_2px_0_rgba(203,213,225,1)] mb-1; }
+            .keycap-composite { @apply bg-blue-50 border-blue-300 text-blue-700 shadow-[0_2px_0_rgba(147,197,253,1)]; }
+            .keycap-layer { @apply bg-emerald-50 border-emerald-300 text-emerald-700 shadow-[0_2px_0_rgba(110,231,183,1)]; }
+            .keycap-blank { @apply bg-slate-100 border-slate-200 text-slate-400 shadow-none; }
         }
     </style>
 </head>
-<body>
-    <div class="container">
-        <h1>Welcome!</h1>
-        <p>This is your index.html file. Feel free to customize it.</p>
+<body class="p-0 sm:p-8 flex flex-col items-center justify-start sm:justify-center min-h-screen">
+
+<div id="css-warning" style="display: none; background: #fee2e2; color: #991b1b; padding: 10px; text-align: center; width: 100%;">
+    <strong>⚠️ Design Engine Blocked:</strong> Please disable your shields/adblocker for this local file and refresh.
+</div>
+
+<div class="max-w-4xl w-full mx-auto flex flex-col gap-6 p-4 sm:p-0" id="appContainer">
+    <div id="uploadScreen" class="w-full">
+        <header class="mb-6 text-center mt-6">
+            <img src="logo_small.png" alt="OMA Logo" class="w-24 h-24 mx-auto mb-4 object-contain drop-shadow-sm">
+            <h2 class="text-3xl sm:text-4xl font-extrabold tracking-tight text-slate-900 mb-1">
+                OMA
+            </h2>
+            <div class="mb-4">
+                <span class="text-xs font-bold text-slate-400 uppercase tracking-[0.2em]">Oryx Migration Assistant</span>
+            </div>
+            <p class="text-slate-500 text-base sm:text-lg max-w-md mx-auto leading-relaxed text-balance">
+                OMA helps you migrate your ZSA layouts to the MoErgo Editor.
+            </p>
+        </header>
+        
+        <main class="glass-panel relative overflow-hidden">
+            <div class="absolute top-0 right-0 -mr-16 -mt-16 w-64 h-64 rounded-full bg-blue-50/50 blur-3xl pointer-events-none"></div>
+            <input type="file" id="fileInput" accept=".zip,.c,.txt" class="sr-only">
+            
+            <div class="drop-zone group relative z-10" id="dropZone" onclick="document.getElementById('fileInput').click()">
+                <div class="flex flex-col items-center justify-center space-y-4">
+                    <div class="w-16 h-16 rounded-2xl bg-white border border-slate-200 shadow-sm flex items-center justify-center group-hover:border-blue-300 group-hover:text-blue-500 transition-colors">
+                        <svg class="w-8 h-8 text-slate-400 group-hover:text-blue-500 transition-colors" id="dropIcon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                    </div>
+                    <div>
+                        <div class="text-lg font-bold text-slate-800" id="dropText">Click or drag your Layout Source .zip here</div>
+                        <div class="text-sm text-slate-500 mt-1" id="dropSubtext">This is the file downloaded from the <strong>Download Source</strong> link.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mt-6 flex justify-center relative z-10">
+                <div class="bg-slate-50 border border-slate-200 rounded-xl px-5 py-4 flex items-start gap-4 max-w-2xl text-left shadow-sm">
+                    <div class="w-8 h-8 rounded-full bg-white border border-slate-200 text-slate-400 flex items-center justify-center shrink-0 shadow-sm">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    </div>
+                    <div>
+                        <strong class="text-slate-900 block text-sm mb-1">Make sure you have your ZSA Oryx Layout Source!</strong>
+                        <p class="text-[13px] text-slate-500 leading-relaxed">
+                            In ZSA Oryx, look just below the main "Save to my keyboard" button at the bottom of the screen and click the <strong class="text-slate-700">Download Source</strong> link to get the required file.
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </main>
     </div>
+
+    <div id="successScreen" class="w-full hidden flex-col gap-6">
+        <div class="text-center mb-4 mt-6 no-print" id="successHeader">
+            <h3 class="text-3xl sm:text-4xl font-extrabold text-slate-900 tracking-tight flex justify-center items-center gap-3 mb-4">
+                <span class="text-4xl drop-shadow-sm">🎉</span> Layout Successfully Migrated!
+            </h3>
+            
+            <div id="boardDetection" class="text-[13px] font-bold text-blue-700 mb-4 bg-blue-50/80 py-2.5 px-5 rounded-full inline-block border border-blue-200 shadow-sm uppercase tracking-wider"></div>
+            
+            <p class="text-slate-500 text-lg max-w-2xl mx-auto mt-2">Follow the instructions below to get the layout on your new keyboard.</p>
+        </div>
+
+        <main class="glass-panel" id="mainResultsPanel">
+            <div class="flex flex-col sm:flex-row gap-4 mb-8 no-print p-6 bg-blue-50/50 rounded-2xl border border-blue-100 justify-end items-center" id="actionHeader">
+                <button onclick="window.UI.printPDF()" class="btn-secondary w-full sm:w-auto">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"></path></svg>
+                    Create PDF Instructions
+                </button>
+                <button onclick="window.App.download()" class="btn-primary w-full sm:w-auto">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                    Download Layout
+                </button>
+            </div>
+            <div id="outputReport"></div>
+        </main>
+        <textarea id="outputJson" class="sr-only" aria-hidden="true"></textarea>
+    </div>
+</div>
+
+<script>
+    window.addEventListener('load', () => {
+        if (!document.querySelector('style[data-tailwindcss]') && !window.tailwind) {
+            document.getElementById('css-warning').style.display = 'block';
+        }
+    });
+</script>
+<script type="module" src="app.js"></script>
 </body>
 </html>
