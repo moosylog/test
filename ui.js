@@ -149,15 +149,17 @@ export const UI = {
         }, 1000);
     },
 
-    buildReport: (layerCount, tapDanceCount, modMorphCount, state) => {
+    buildReport: (layerCount, tapDanceCount, modMorphCount, macroCount, state) => {
         const reportContainer = document.getElementById('outputReport');
         if (!reportContainer) return;
 
         const warnInstances = Object.values(state.log.warning || {}).reduce((a, c) => a + c.count, 0);
-        const macroCount = Object.keys(state.macros || {}).length;
+        const rawMacroCount = Object.keys(state.macros || {}).length;
         const tdLogCount = Object.keys(state.log.tap_dance || {}).length;
         const mmLogCount = Object.keys(state.log.mod_morph || {}).length;
-        const totalNeedsRebuild = warnInstances + macroCount;
+        // Remaining rebuild burden = warnings + any macros that couldn't be decoded
+        const remainingMacros = Math.max(0, rawMacroCount - macroCount);
+        const totalNeedsRebuild = warnInstances + remainingMacros;
 
         const stdInstances = Object.values(state.log.layer_binding || {}).reduce((a, c) => a + c.count, 0);
         const htInstances = Object.values(state.log.hold_tap || {}).reduce((a, c) => a + c.count, 0);
@@ -329,17 +331,17 @@ export const UI = {
                             <p class="text-[13px] text-slate-500 leading-relaxed max-w-xl">ZSA keeps layer names (like "Symbols" or "Nav") hidden in the cloud. Take a quick moment to re-label <em>Layer_0</em>, <em>Layer_1</em>, etc. inside the Layout Editor.</p>
                         </div>
                     </div>
-                    ${(tapDanceCount > 0 || modMorphCount > 0) ? `
+                    ${(tapDanceCount > 0 || modMorphCount > 0 || macroCount > 0) ? `
                     <div class="checklist-item bg-violet-50/20">
-                        <div class="step-circle" style="background:#ede9fe;color:#7c3aed;border-color:#c4b5fd;">${totalNeedsRebuild > 0 ? '4' : '4'}</div>
+                        <div class="step-circle" style="background:#ede9fe;color:#7c3aed;border-color:#c4b5fd;">4</div>
                         <div class="mt-0.5">
-                            <strong class="text-slate-900 block text-[15px] mb-1">Verify your Tap-Dances & Mod-Morphs</strong>
-                            <p class="text-[13px] text-slate-500 leading-relaxed max-w-xl">We auto-migrated <strong>${tapDanceCount} tap-dance${tapDanceCount !== 1 ? 's' : ''}</strong>${modMorphCount > 0 ? ` and <strong>${modMorphCount} mod-morph${modMorphCount !== 1 ? 's' : ''}</strong>` : ''} into your JSON. Open the <strong>Tap-Dance</strong>${modMorphCount > 0 ? ' and <strong>Mod-Morph</strong>' : ''} tab${modMorphCount > 0 ? 's' : ''} in the MoErgo Layout Editor and confirm each binding looks correct before flashing.</p>
+                            <strong class="text-slate-900 block text-[15px] mb-1">Verify your Auto-Migrated Behaviors</strong>
+                            <p class="text-[13px] text-slate-500 leading-relaxed max-w-xl">We auto-migrated ${[tapDanceCount > 0 ? `<strong>${tapDanceCount} tap-dance${tapDanceCount !== 1 ? 's' : ''}</strong>` : '', modMorphCount > 0 ? `<strong>${modMorphCount} mod-morph${modMorphCount !== 1 ? 's' : ''}</strong>` : '', macroCount > 0 ? `<strong>${macroCount} macro${macroCount !== 1 ? 's' : ''}</strong>` : ''].filter(Boolean).join(', ')} into your JSON. Open the relevant tabs in the MoErgo Layout Editor and confirm each binding looks correct before flashing.</p>
                         </div>
                     </div>` : ''}
                     ${totalNeedsRebuild > 0 ? `
                     <div class="checklist-item bg-orange-50/30">
-                        <div class="step-circle step-circle-warn">${(tapDanceCount > 0 || modMorphCount > 0) ? '5' : '4'}</div>
+                        <div class="step-circle step-circle-warn">${(tapDanceCount > 0 || modMorphCount > 0 || macroCount > 0) ? '5' : '4'}</div>
                         <div class="mt-0.5">
                             <strong class="text-slate-900 block text-[15px] mb-1">Rebuild your Advanced Features</strong>
                             <p class="text-[13px] text-slate-500 leading-relaxed max-w-xl">We noticed you had some custom macros or advanced ZSA features! We safely left those keys blank. Check the detailed summary below for exact code references and instructions on how to rebuild them in ZMK.</p>
@@ -360,7 +362,8 @@ export const UI = {
                     <div class="stat-box"><div class="stat-num">${totalMapped}</div><div class="stat-label">Keys Auto-Mapped</div></div>
                     <div class="stat-box ${tapDanceCount > 0 ? '' : ''}"><div class="stat-num text-violet-600">${tapDanceCount}</div><div class="stat-label">Tap-Dances</div></div>
                     <div class="stat-box ${modMorphCount > 0 ? '' : ''}"><div class="stat-num text-teal-600">${modMorphCount}</div><div class="stat-label">Mod-Morphs</div></div>
-                    <div class="stat-box ${warnInstances > 0 ? 'warning' : ''}"><div class="stat-num">${warnInstances}</div><div class="stat-label">Actions Required</div></div>
+                    <div class="stat-box ${macroCount > 0 ? '' : ''}"><div class="stat-num text-emerald-600">${macroCount}</div><div class="stat-label">Macros</div></div>
+                    <div class="stat-box ${totalNeedsRebuild > 0 ? 'warning' : ''}"><div class="stat-num">${totalNeedsRebuild}</div><div class="stat-label">Actions Required</div></div>
                 </div>
                 
                 <details class="report-category" open>

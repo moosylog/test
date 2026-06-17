@@ -29,9 +29,9 @@ const Utils = {
     },
     getZmkSuggestion: (tok) => {
         if (!tok) return "Requires a custom ZMK Behavior.";
-        if (tok.includes('ALL_T')) return "ZMK does not natively support holding all modifiers. Build a custom macro.";
+        if (tok.includes('ALL_T')) return "Auto-migrated: custom Hold-Tap with LS(LC(LA(LGUI))) hold added to .holdTaps[].";
         if (tok.includes('TD(') || tok.includes('DANCE_')) return "Rebuild using ZMK Tap-Dance (&td) or Mod-Morph (&morph).";
-        if (tok.includes('QK_LLCK')) return "Rebuild using ZMK Sticky Layer (&sl) or Toggle Layer (&tog).";
+        if (tok.includes('QK_LLCK')) return "Auto-migrated: mapped to &tog (layer toggle). Adjust the layer index in the MoErgo editor if needed.";
         if (tok.includes('MAC_') || tok.includes('PC_')) return "Recreate as a custom ZMK Macro (&macro).";
         if (tok.includes('NAVIGATOR') || tok.includes('MS_JIGGLER') || tok.includes('SCROLL') || tok.includes('MS_DBL_CLICK')) return "Requires native ZMK Mouse Keys bindings.";
         if (tok.includes('LAYER_COLOR') || tok.includes('RGB') || tok.includes('HSV_')) return "Rebuild using ZMK RGB Underglow behaviors (&rgb_ug).";
@@ -232,6 +232,76 @@ const Parser = {
         let positionName = layerIdx === "Combo" ? "Inside Combo" : Utils.getSourcePosition(keyIdx);
         const context = { layer: layerIdx, pos: positionName, config: configInfo, color: keyColor };
         
+        // ── QK_LLCK → &tog (Layer Lock) ──────────────────────────────────────────
+        // QK_LLCK freezes whichever layer is currently held. ZMK closest equivalent
+        // is &tog (permanent toggle). We default to layer 1 (the first user layer)
+        // and log it so the user can adjust in the editor.
+        if (tok === 'QK_LLCK') {
+            Utils.logConversion(state, rawToken, "&tog 1", "layer_binding",
+                "QK_LLCK mapped to &tog 1 (layer toggle). Adjust layer index in the MoErgo editor.", context);
+            return { value: "&tog", params: [{ value: 1, params: [] }] };
+        }
+
+        // ── ALL_T(KC_X) → custom hold-tap with Hyper modifiers ───────────────────
+        // ALL_T holds all four modifiers (Shift+Ctrl+Alt+GUI = Hyper). We emit a
+        // custom hold-tap behavior entry into state.allTHoldTaps[] for later merge
+        // into .holdTaps[], and return the correctly nested matrix binding node.
+        // The hold AST uses LS→LC→LA→LGUI nesting per the MoErgo modifier spec.
+        if (tok.startsWith('ALL_T(')) {
+            const innerMatch = tok.match(/^ALL_T\(\s*([^)]+)\s*\)$/i);
+            const tapRaw  = innerMatch ? innerMatch[1].trim() : null;
+            const tapAst  = tapRaw ? Parser.parseMacroParam(tapRaw, state, context) : null;
+            const tapKey  = (tapAst && tapAst.value !== 'none') ? tapAst : { value: "SPACE", params: [] };
+            const safeName = tapKey.value.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+            const htName  = `&ht_hyper_${safeName}`;
+
+            // Full nested Hyper modifier tree: LS → LC → LA → LGUI (leaf)
+            const hyperHoldAst = {
+                value: "LS", params: [{
+                    value: "LC", params: [{
+                        value: "LA", params: [{
+                            value: "LGUI", params: []
+                        }]
+                    }]
+                }]
+            };
+
+            // Register the hold-tap behavior definition if not already created
+            if (!state.allTHoldTaps) state.allTHoldTaps = {};
+            if (!state.allTHoldTaps[htName]) {
+                state.allTHoldTaps[htName] = {
+                    name: htName,
+                    description: `Migrated from QMK: ALL_T — Hyper Mod-Tap (hold = Shift+Ctrl+Alt+GUI, tap = ${tapKey.value})`,
+                    bindings: ["&kp", "&kp"],
+                    flavor: "tap-preferred",
+                    tappingTermMs: state.config.tappingTerm,
+                    quickTapMs: -1,
+                    requirePriorIdleMs: 150,
+                    holdTriggerOnRelease: false,
+                    holdTriggerKeyPositions: []
+                };
+            }
+
+            Utils.logConversion(state, rawToken, htName, "hold_tap",
+                `Hyper hold-tap: hold = LS(LC(LA(LGUI))), tap = ${tapKey.value}`);
+            // Matrix binding: both hold and tap params must be leaf-terminated
+            if (!tapKey.params) tapKey.params = [];
+            return {
+                value: htName,
+                params: [ hyperHoldAst, tapKey ]
+            };
+        }
+
+        // ── ST_MACRO_N → silent placeholder; decoded after layer pass ─────────────
+        // The macro body is already captured in state.macros[ST_MACRO_N] by the
+        // pre-processing pass. Return &none silently here; the post-layer macro
+        // decode pass will emit .macros[] entries and rewrite these matrix slots.
+        if (tok.includes('ST_MACRO_')) {
+            state._pendingMacroTokens = state._pendingMacroTokens || {};
+            state._pendingMacroTokens[rawToken] = { layerIdx, keyIdx };
+            return { value: "&none" };
+        }
+
         if (Constants.DEALBREAKER_KEYS.some(bad => tok.includes(bad))) {
             // TD( tokens are handled by the post-layer rewrite pass — silence them here.
             if (tok.startsWith('TD(') || tok.startsWith('DANCE_')) {
@@ -850,6 +920,118 @@ self.onmessage = async function(e) {
             });
         });
 
+        // ── ST_MACRO DECODE PASS ──────────────────────────────────────────────────
+        // Parse QMK macro bodies into MoErgo .macros[] schema entries and rewrite
+        // the placeholder &none matrix slots with the macro reference node.
+        //
+        // MoErgo macro schema (per spec):
+        // { name, description, waitMs, tapMs, bindings: [{ value:"&kp", params:[{value:"X",params:[]}] }] }
+        // Zero-param matrix node: { value: "&my_macro" }  (no params key at all)
+        //
+        // QMK macro bodies use SEND_STRING("...") or register_code16(KC_X) sequences.
+        // We parse both patterns and emit one binding object per key event.
+        const generatedMacros = [];
+        const macroMatrixNodes = {}; // ST_MACRO_N → { value: "&macro_name" }
+
+        const SEND_STRING_CHAR_TO_ZMK = {
+            ' ': 'SPACE', '\n': 'ENTER', '\t': 'TAB', '!': 'EXCLAMATION', '@': 'AT',
+            '#': 'HASH', '$': 'DOLLAR', '%': 'PERCENT', '^': 'CARET', '&': 'AMPERSAND',
+            '*': 'ASTERISK', '(': 'LPAR', ')': 'RPAR', '-': 'MINUS', '_': 'UNDER',
+            '+': 'PLUS', '=': 'EQUAL', '[': 'LBKT', ']': 'RBKT', '{': 'LBRC', '}': 'RBRC',
+            '\\': 'BSLH', '|': 'PIPE', ';': 'SEMI', ':': 'COLON', "'": 'SQT', '"': 'DQT',
+            ',': 'COMMA', '.': 'DOT', '/': 'FSLH', '?': 'QMARK', '<': 'LT', '>': 'GT',
+            '`': 'GRAVE', '~': 'TILDE'
+        };
+        // Characters that require Shift to type
+        const SHIFT_CHARS = new Set('!@#$%^&*()_+{}|:"<>?~');
+
+        const buildMacroBindings = (macroBody) => {
+            const bindings = [];
+            // Pattern 1: SEND_STRING("literal text")
+            const ssMatch = macroBody.match(/SEND_STRING\(\s*"([^"]*)"\s*\)/);
+            if (ssMatch) {
+                for (const ch of ssMatch[1]) {
+                    const upper = ch.toUpperCase();
+                    const zmkKey = SEND_STRING_CHAR_TO_ZMK[ch] || (upper >= 'A' && upper <= 'Z' ? upper : null);
+                    if (!zmkKey) continue;
+                    if (SHIFT_CHARS.has(ch)) {
+                        // Shifted character: &kp LS(KEY)
+                        bindings.push({ value: "&kp", params: [{ value: "LS", params: [{ value: zmkKey, params: [] }] }] });
+                    } else if (ch >= 'A' && ch <= 'Z') {
+                        // Capital letter: &kp LS(LETTER)
+                        bindings.push({ value: "&kp", params: [{ value: "LS", params: [{ value: zmkKey, params: [] }] }] });
+                    } else {
+                        bindings.push({ value: "&kp", params: [{ value: zmkKey, params: [] }] });
+                    }
+                }
+                return bindings;
+            }
+            // Pattern 2: register_code16(KC_X) / tap_code16(KC_X) sequence
+            const codeRe = /(?:register_code16|tap_code16)\(\s*([A-Za-z0-9_()\s]+?)\s*\)/g;
+            let m;
+            while ((m = codeRe.exec(macroBody)) !== null) {
+                const ast = Parser.parseMacroParam(m[1].trim(), state, null);
+                if (ast && ast.value !== 'none') {
+                    // Ensure leaf params arrays are present
+                    const ensureLeaf = (n) => { if (n && !n.params) n.params = []; if (n?.params) n.params = n.params.map(ensureLeaf); return n; };
+                    bindings.push({ value: "&kp", params: [ensureLeaf(ast)] });
+                }
+            }
+            return bindings;
+        };
+
+        for (const [macroName, macroBody] of Object.entries(state.macros)) {
+            const shortName = macroName.toLowerCase().replace(/[^a-z0-9]/g, '_');
+            const zmkName   = `&macro_${shortName}`;
+            const bindings  = buildMacroBindings(macroBody);
+
+            if (bindings.length === 0) {
+                // Could not decode — warn and leave as &none
+                Utils.logConversion(state, macroName, '&none', 'warning',
+                    'Could not decode macro body. Rebuild manually in the MoErgo Macro editor.', null);
+                continue;
+            }
+
+            generatedMacros.push({
+                name: zmkName,
+                description: `Migrated from QMK: ${macroName}`,
+                waitMs: 100,
+                tapMs: 30,
+                bindings
+            });
+            macroMatrixNodes[macroName] = { value: zmkName };
+            Utils.logConversion(state, macroName, zmkName, 'layer_binding',
+                `Macro migrated: ${bindings.length} key events → .macros[]`);
+        }
+
+        // Rewrite ST_MACRO_ placeholder &none nodes in astLayers
+        rawLayers.forEach((layerStr, layerIdx) => {
+            const tokens = Parser.splitQmkKeys(layerStr);
+            tokens.forEach((tok, keyIdx) => {
+                const clean = tok.trim();
+                if (!clean.includes('ST_MACRO_')) return;
+                // Extract the macro name (may be bare or inside a function call)
+                const macroNameMatch = clean.match(/\b(ST_MACRO_[A-Za-z0-9_]+)\b/);
+                if (!macroNameMatch) return;
+                const macroName = macroNameMatch[1];
+                const node = macroMatrixNodes[macroName];
+                if (!node) return;
+
+                let targetIdx = keyIdx;
+                if (activeBoard.matrixMap) targetIdx = activeBoard.matrixMap[keyIdx] ?? keyIdx;
+                if (activeBoard.isVoyager) {
+                    if      (keyIdx === 48) targetIdx = 50;
+                    else if (keyIdx === 49) targetIdx = 51;
+                    else if (keyIdx === 50) targetIdx = 54;
+                    else if (keyIdx === 51) targetIdx = 55;
+                    else if (keyIdx >= 52)  targetIdx = -1;
+                }
+                if (targetIdx >= 0 && targetIdx < activeBoard.targetKeyCount) {
+                    astLayers[layerIdx][targetIdx] = node;
+                }
+            });
+        });
+
         let templateJson;
         try {
             let res = await fetch(`${activeBoard.templateUrl}?v=${Date.now()}`); 
@@ -909,9 +1091,20 @@ self.onmessage = async function(e) {
             templateJson.holdTaps = (templateJson.holdTaps || []).concat(generatedHoldTapsFromTd);
         }
 
+        // Merge hold-taps generated from ALL_T() tokens (.holdTaps[])
+        const allTEntries = Object.values(state.allTHoldTaps || {});
+        if (allTEntries.length > 0) {
+            templateJson.holdTaps = (templateJson.holdTaps || []).concat(allTEntries);
+        }
+
         // Merge mod-morphs into the JSON (MoErgo schema: .modMorphs[])
         if (generatedModMorphs.length > 0) {
             templateJson.modMorphs = (templateJson.modMorphs || []).concat(generatedModMorphs);
+        }
+
+        // Merge decoded macros into the JSON (MoErgo schema: .macros[])
+        if (generatedMacros.length > 0) {
+            templateJson.macros = (templateJson.macros || []).concat(generatedMacros);
         }
 
         // Total "migrated" tap-dance behaviors = all three output types combined
@@ -924,6 +1117,7 @@ self.onmessage = async function(e) {
             layerCount: astLayers.length,
             tapDanceCount: totalTdMigrated,
             modMorphCount: generatedModMorphs.length,
+            macroCount: generatedMacros.length,
             detectedBoard: activeBoard.name,
             targetBoard: activeBoard.targetBoard
         });
