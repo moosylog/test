@@ -183,8 +183,18 @@ const Parser = {
         if (/^F[1-9][0-9]?$/.test(clean) || /^[A-Z]$/.test(clean)) return clean;
         if (clean === "none" || clean === "trans" || clean === 'QK_BOOT' || clean === 'CW_TOGG') return clean;
         if (clean.startsWith('RGB_')) return clean;
-        if (clean.startsWith('STN_') || clean.startsWith('QK_STENO') || clean.startsWith('DM_') || clean.startsWith('HSV_') || clean === 'LED_LEVEL') {
+        if (clean.startsWith('STN_') || clean.startsWith('QK_STENO') || clean.startsWith('HSV_') || clean === 'LED_LEVEL') {
             Utils.logConversion(state, rawToken || str, "&none", "warning", Utils.getZmkSuggestion(rawToken || str), context);
+            return "none";
+        }
+        if (clean.startsWith('DM_')) {
+            Utils.logConversion(state, rawToken || str, "&none", "warning",
+                "QMK Dynamic Macros have no ZMK equivalent. Record macros manually in ZMK using &macro definitions.", context);
+            return "none";
+        }
+        if (clean.startsWith('MS_ACCEL') || clean.startsWith('KC_MS_ACCEL')) {
+            Utils.logConversion(state, rawToken || str, "&none", "warning",
+                "Mouse acceleration keys have no ZMK equivalent — ZMK mouse speed is set via &zip_xy_scaler in the JSON config.", context);
             return "none";
         }
         Utils.logConversion(state, rawToken || str, "&none", "warning", Utils.getZmkSuggestion(rawToken || str), context);
@@ -309,6 +319,44 @@ const Parser = {
             }
             Utils.logConversion(state, rawToken, "&none", "warning", Utils.getZmkSuggestion(rawToken), context);
             return { value: "&none" };
+        }
+
+        // ── DUAL_FUNC_N override (process_record_user tap/hold) ──────────────────
+        // DUAL_FUNC_N defines are #defined as LT(x, KC_y) but may have a
+        // process_record_user override with different tap and hold keycodes.
+        // If an override exists, use those real values instead of the raw define.
+        if (tok.startsWith('DUAL_FUNC_') && state.dualFuncOverrides?.[tok]) {
+            const { tapRaw, holdRaw } = state.dualFuncOverrides[tok];
+            const isLayerHold = holdRaw?.startsWith('__LAYER_');
+            const layerNum = isLayerHold ? parseInt(holdRaw.replace('__LAYER_', '')) : null;
+
+            const tapAst  = tapRaw  ? Parser.parseMacroParam(tapRaw,  state, context) : null;
+            const holdAst = isLayerHold
+                ? { value: layerNum, params: [] }
+                : holdRaw ? Parser.parseMacroParam(holdRaw, state, context) : null;
+
+            if (tapAst && holdAst && tapAst.value !== 'none' && holdAst.value !== 'none') {
+                const htName = `&ht_df_${tok.toLowerCase()}`;
+                if (!state.allTHoldTaps) state.allTHoldTaps = {};
+                if (!state.allTHoldTaps[htName]) {
+                    state.allTHoldTaps[htName] = {
+                        name: htName,
+                        description: `Migrated from QMK: ${tok} override (hold=${isLayerHold ? `layer ${layerNum}` : holdRaw}, tap=${tapRaw})`,
+                        bindings: isLayerHold ? ["&mo", "&kp"] : ["&kp", "&kp"],
+                        flavor: "tap-preferred",
+                        tappingTermMs: state.config.tappingTerm,
+                        quickTapMs: -1,
+                        requirePriorIdleMs: 125,
+                        holdTriggerOnRelease: false,
+                        holdTriggerKeyPositions: []
+                    };
+                }
+                if (!tapAst.params) tapAst.params = [];
+                if (!holdAst.params) holdAst.params = [];
+                Utils.logConversion(state, rawToken, htName, "hold_tap",
+                    `DUAL_FUNC override: hold=${isLayerHold ? `layer ${layerNum}` : holdRaw}, tap=${tapRaw}`);
+                return { value: htName, params: [holdAst, tapAst] };
+            }
         }
 
         let resolveCount = 0;
@@ -589,6 +637,56 @@ self.onmessage = async function(e) {
             if (end !== -1) state.macros[match[1]] = `case ${match[1]}:\n${rawText.substring(start + match[0].length, end).trim()}\n    break;`;
         }
 
+        // ── DUAL_FUNC override extraction ─────────────────────────────────────────
+        // Oryx sometimes emits custom #define DUAL_FUNC_N LT(x, KC_y) combined with
+        // a process_record_user override that changes the actual tap/hold behaviour.
+        // The raw #define is already in state.defines; here we read the case blocks
+        // to extract the REAL tap and hold actions and store them in
+        // state.dualFuncOverrides[DUAL_FUNC_N] = { tapRaw, holdRaw }
+        // so that translateAst can use the overridden values instead of the define.
+        state.dualFuncOverrides = {};
+        {
+            // Balanced-paren helper for the extraction below
+            const bpe = (str, fnName, from = 0) => {
+                const p = str.indexOf(fnName + '(', from);
+                if (p === -1) return null;
+                let depth = 0, i = p + fnName.length;
+                while (i < str.length) {
+                    if (str[i] === '(') depth++;
+                    else if (str[i] === ')') { depth--; if (depth === 0) return str.substring(p + fnName.length + 1, i).trim(); }
+                    i++;
+                }
+                return null;
+            };
+
+            // Find all DUAL_FUNC_N case blocks in process_record_user
+            const dfCaseRe = /case\s+(DUAL_FUNC_\d+)\s*:([\s\S]*?)(?=case\s+[A-Z]|\}\s*return true)/g;
+            let dfm;
+            while ((dfm = dfCaseRe.exec(rawText)) !== null) {
+                const name = dfm[1], body = dfm[2];
+
+                // Tap branch: if (record->tap.count > 0) { register_code16(X); }
+                let tapRaw = null;
+                const tapBranchMatch = body.match(/tap\.count\s*(?:&&\s*!record->tap\.interrupted)?\s*\)\s*\{[\s\S]*?register_code16\(([^;]+)\)/);
+                if (tapBranchMatch) tapRaw = bpe(tapBranchMatch[0], 'register_code16') || tapBranchMatch[1].trim();
+
+                // Hold branch: else { ... layer_on(N) or register_code16(Y) }
+                let holdRaw = null;
+                const holdLayerMatch = body.match(/layer_on\(\s*(\d+)\s*\)/);
+                if (holdLayerMatch) {
+                    holdRaw = `__LAYER_${holdLayerMatch[1]}`;
+                } else {
+                    // Find the else { } block and grab register_code16 from it
+                    const elseBranchMatch = body.match(/\}\s*else\s*\{[\s\S]*?register_code16\(([^;]+)\)/);
+                    if (elseBranchMatch) holdRaw = bpe(elseBranchMatch[0], 'register_code16') || elseBranchMatch[1].trim();
+                }
+
+                if (tapRaw || holdRaw) {
+                    state.dualFuncOverrides[name] = { tapRaw, holdRaw };
+                }
+            }
+        }
+
         let caseRegexFast = /case\s+([A-Za-z0-9_]+)\s*:/g;
         while ((match = caseRegexFast.exec(rawText)) !== null) {
             let name = match[1];
@@ -702,26 +800,49 @@ self.onmessage = async function(e) {
 
         // ── Helper: extract all keycodes from a branch label in a switch block ──
         // Returns raw QMK strings found after each `case <LABEL>:` line.
+        // Uses balanced-paren extraction to correctly handle nested modifiers like
+        // LCTL(KC_Z), LCTL(LSFT(KC_V)), LALT(LSFT(KC_V)) without truncation.
         const extractBranchCodes = (block) => {
-            // Branch labels we care about
             const branches = {
                 SINGLE_TAP: [],
                 SINGLE_HOLD: [],
                 DOUBLE_TAP: [],
                 DOUBLE_HOLD: [],
             };
-            // Match: case LABEL: ... register_code16(X) / tap_code16(X) / layer_on(N)
+
+            // Balanced-paren extractor: finds the argument of fn_name(...) at pos
+            const extractBalancedArg = (str, fnName, startPos) => {
+                const fnPos = str.indexOf(fnName + '(', startPos);
+                if (fnPos === -1) return null;
+                const openParen = fnPos + fnName.length;
+                let depth = 0, i = openParen;
+                while (i < str.length) {
+                    if (str[i] === '(') depth++;
+                    else if (str[i] === ')') { depth--; if (depth === 0) return str.substring(openParen + 1, i).trim(); }
+                    i++;
+                }
+                return null;
+            };
+
             const caseRe = /case\s+(SINGLE_TAP|SINGLE_HOLD|DOUBLE_TAP|DOUBLE_HOLD)[^:]*:([\s\S]*?)(?=case\s+(?:SINGLE_TAP|SINGLE_HOLD|DOUBLE_TAP|DOUBLE_HOLD|DOUBLE_SINGLE_TAP)|$)/g;
             let cm;
             while ((cm = caseRe.exec(block)) !== null) {
                 const label = cm[1];
                 const body  = cm[2];
-                // Collect register_code16 / tap_code16 args
-                const codeRe = /(?:register_code16|tap_code16)\(\s*([A-Za-z0-9_()\s]+?)\s*\)/g;
-                let mm;
-                while ((mm = codeRe.exec(body)) !== null) branches[label].push(mm[1].trim());
-                // Collect layer_on(N) args
+                // Balanced extraction of register_code16 and tap_code16 args
+                let pos = 0;
+                for (const fn of ['register_code16', 'tap_code16']) {
+                    let searchFrom = 0;
+                    while (true) {
+                        const arg = extractBalancedArg(body, fn, searchFrom);
+                        if (arg === null) break;
+                        branches[label].push(arg);
+                        searchFrom = body.indexOf(fn + '(', searchFrom) + fn.length + 1;
+                    }
+                }
+                // layer_on(N) extraction
                 const layerRe = /layer_on\(\s*(\d+)\s*\)/g;
+                let mm;
                 while ((mm = layerRe.exec(body)) !== null) branches[label].push(`__LAYER_${mm[1]}`);
             }
             return branches;
@@ -945,36 +1066,164 @@ self.onmessage = async function(e) {
         // Characters that require Shift to type
         const SHIFT_CHARS = new Set('!@#$%^&*()_+{}|:"<>?~');
 
+        // ── Helper: balanced-paren argument extractor ─────────────────────────────
+        // Used by both macro parser and dance extractor. Finds the content of
+        // fn_name(...) starting from startPos, correctly handling nesting.
+        const extractBalancedArg = (str, fnName, startPos = 0) => {
+            const fnPos = str.indexOf(fnName + '(', startPos);
+            if (fnPos === -1) return null;
+            let depth = 0, i = fnPos + fnName.length;
+            while (i < str.length) {
+                if (str[i] === '(') depth++;
+                else if (str[i] === ')') { depth--; if (depth === 0) return { arg: str.substring(fnPos + fnName.length + 1, i).trim(), end: i + 1 }; }
+                i++;
+            }
+            return null;
+        };
+
+        const ensureLeaf = (n) => { if (!n) return n; if (!n.params) n.params = []; else n.params = n.params.map(ensureLeaf); return n; };
+
         const buildMacroBindings = (macroBody) => {
             const bindings = [];
-            // Pattern 1: SEND_STRING("literal text")
-            const ssMatch = macroBody.match(/SEND_STRING\(\s*"([^"]*)"\s*\)/);
-            if (ssMatch) {
-                for (const ch of ssMatch[1]) {
-                    const upper = ch.toUpperCase();
-                    const zmkKey = SEND_STRING_CHAR_TO_ZMK[ch] || (upper >= 'A' && upper <= 'Z' ? upper : null);
-                    if (!zmkKey) continue;
-                    if (SHIFT_CHARS.has(ch)) {
-                        // Shifted character: &kp LS(KEY)
-                        bindings.push({ value: "&kp", params: [{ value: "LS", params: [{ value: zmkKey, params: [] }] }] });
-                    } else if (ch >= 'A' && ch <= 'Z') {
-                        // Capital letter: &kp LS(LETTER)
-                        bindings.push({ value: "&kp", params: [{ value: "LS", params: [{ value: zmkKey, params: [] }] }] });
-                    } else {
-                        bindings.push({ value: "&kp", params: [{ value: zmkKey, params: [] }] });
+
+            // ── SS_ macro syntax parser ───────────────────────────────────────────
+            // QMK SEND_STRING uses SS_ macros, not string literals in this keymap.
+            // We tokenize the full body into a sequence of SS_ tokens and decode each.
+            //
+            // Supported patterns:
+            //   SS_TAP(X_KEY)          → &kp KEY
+            //   SS_LSFT(SS_TAP(X_KEY)) → &kp LS(KEY)
+            //   SS_LCTL(SS_TAP(X_KEY)) → &kp LC(KEY)
+            //   SS_LALT(SS_TAP(X_KEY)) → &kp LA(KEY)
+            //   SS_LGUI(SS_TAP(X_KEY)) → &kp LG(KEY)
+            //   SS_LALT(SS_TAP(X_KP_N)SS_TAP(X_KP_M)...) → sequence of &kp LA(KP_Nn) bindings
+            //   SS_DELAY(N)            → skip
+            //   SS_LCTL(SS_TAP(X_LEFT)) → &kp LC(LEFT)
+
+            // X_ keycode → ZMK keycode mapping (extends constants map)
+            const X_TO_ZMK = {
+                'KP_0':'KP_N0','KP_1':'KP_N1','KP_2':'KP_N2','KP_3':'KP_N3','KP_4':'KP_N4',
+                'KP_5':'KP_N5','KP_6':'KP_N6','KP_7':'KP_N7','KP_8':'KP_N8','KP_9':'KP_N9',
+                'SPACE':'SPACE','ENTER':'ENTER','TAB':'TAB','BACKSPACE':'BACKSPACE',
+                'DELETE':'DELETE','UP':'UP','DOWN':'DOWN','LEFT':'LEFT','RIGHT':'RIGHT',
+                'HOME':'HOME','END':'END','PAGE_UP':'PG_UP','PAGE_DOWN':'PG_DN',
+                'ESCAPE':'ESC','QUOTE':'SQT','DQUO':'DQT','MINUS':'MINUS','EQUAL':'EQUAL',
+                'COMMA':'COMMA','DOT':'DOT','SLASH':'FSLH','BACKSLASH':'BSLH',
+                'SEMICOLON':'SEMI','GRAVE':'GRAVE','LBRACKET':'LBKT','RBRACKET':'RBKT',
+                '1':'N1','2':'N2','3':'N3','4':'N4','5':'N5','6':'N6','7':'N7','8':'N8','9':'N9','0':'N0',
+                'F1':'F1','F2':'F2','F3':'F3','F4':'F4','F5':'F5','F6':'F6',
+                'F7':'F7','F8':'F8','F9':'F9','F10':'F10','F11':'F11','F12':'F12',
+            };
+            // Add A-Z passthrough
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').forEach(c => X_TO_ZMK[c] = c);
+
+            const resolveX = (xKey) => {
+                const k = xKey.trim().replace(/^X_/, '');
+                return X_TO_ZMK[k] || Constants.QMK_TO_ZMK_MAP[k] || k;
+            };
+
+            // Decode a modifier wrapper (SS_LSFT, SS_LCTL etc.) into a ZMK mod string
+            const SS_MOD_MAP = {
+                'SS_LSFT': 'LS', 'SS_RSFT': 'RS',
+                'SS_LCTL': 'LC', 'SS_RCTL': 'RC',
+                'SS_LALT': 'LA', 'SS_RALT': 'RA',
+                'SS_LGUI': 'LG', 'SS_RGUI': 'RG',
+            };
+
+            // Parse one SS_TAP(X_KEY) and return ZMK key string
+            const parseSsTap = (inner) => {
+                const tapMatch = inner.match(/^X_(.+)$/);
+                return tapMatch ? resolveX(tapMatch[1]) : resolveX(inner);
+            };
+
+            // Recursively parse an SS_ expression into a ZMK binding node
+            const parseSsExpr = (expr) => {
+                expr = expr.trim();
+                if (!expr) return null;
+
+                // SS_DELAY → skip
+                if (expr.startsWith('SS_DELAY')) return null;
+
+                // SS_TAP(X_KEY) → { value: "KEY", params: [] }
+                if (expr.startsWith('SS_TAP(')) {
+                    const r = extractBalancedArg(expr, 'SS_TAP');
+                    if (!r) return null;
+                    return { value: parseSsTap(r.arg), params: [] };
+                }
+
+                // SS_MOD(inner...) → wraps each SS_TAP in inner with the mod
+                for (const [ssMod, zmkMod] of Object.entries(SS_MOD_MAP)) {
+                    if (!expr.startsWith(ssMod + '(')) continue;
+                    const r = extractBalancedArg(expr, ssMod);
+                    if (!r) continue;
+                    const inner = r.arg;
+
+                    // Collect all SS_TAP calls inside this mod wrapper
+                    const tapNodes = [];
+                    let searchFrom = 0;
+                    while (true) {
+                        const tapR = extractBalancedArg(inner, 'SS_TAP', searchFrom);
+                        if (!tapR) break;
+                        tapNodes.push(parseSsTap(tapR.arg));
+                        searchFrom = inner.indexOf('SS_TAP(', searchFrom) + 7;
+                    }
+                    if (tapNodes.length === 0) return null;
+
+                    // Multiple SS_TAP inside one mod wrapper → one binding per tap, each wrapped in the mod
+                    // (common for Alt+Numpad sequences)
+                    return tapNodes.map(key => ({
+                        value: zmkMod,
+                        params: [{ value: key, params: [] }]
+                    }));
+                }
+                return null;
+            };
+
+            // Tokenize the full macro body into top-level SS_ expressions
+            // Strategy: scan for SS_XXX( calls at top level, extract each with balanced parens
+            const SS_FNS = [...Object.keys(SS_MOD_MAP), 'SS_TAP', 'SS_DELAY'];
+            let pos = 0;
+            const body = macroBody;
+
+            while (pos < body.length) {
+                // Find the next SS_ function call
+                let nearestPos = body.length;
+                let nearestFn = null;
+                for (const fn of SS_FNS) {
+                    const p = body.indexOf(fn + '(', pos);
+                    if (p !== -1 && p < nearestPos) { nearestPos = p; nearestFn = fn; }
+                }
+                if (!nearestFn) break;
+
+                const r = extractBalancedArg(body, nearestFn, nearestPos);
+                if (!r) { pos = nearestPos + nearestFn.length + 1; continue; }
+
+                const fullExpr = nearestFn + '(' + r.arg + ')';
+                const result = parseSsExpr(fullExpr);
+
+                if (result) {
+                    const nodes = Array.isArray(result) ? result : [result];
+                    for (const node of nodes) {
+                        bindings.push({ value: "&kp", params: [ensureLeaf(node)] });
                     }
                 }
-                return bindings;
+                pos = r.end + (nearestPos - (body.lastIndexOf(nearestFn + '(', nearestPos) === nearestPos ? 0 : 0));
+                pos = nearestPos + nearestFn.length + 1 + r.arg.length + 1;
             }
-            // Pattern 2: register_code16(KC_X) / tap_code16(KC_X) sequence
-            const codeRe = /(?:register_code16|tap_code16)\(\s*([A-Za-z0-9_()\s]+?)\s*\)/g;
-            let m;
-            while ((m = codeRe.exec(macroBody)) !== null) {
-                const ast = Parser.parseMacroParam(m[1].trim(), state, null);
-                if (ast && ast.value !== 'none') {
-                    // Ensure leaf params arrays are present
-                    const ensureLeaf = (n) => { if (n && !n.params) n.params = []; if (n?.params) n.params = n.params.map(ensureLeaf); return n; };
-                    bindings.push({ value: "&kp", params: [ensureLeaf(ast)] });
+
+            if (bindings.length > 0) return bindings;
+
+            // ── Fallback: register_code16 / tap_code16 sequences ─────────────────
+            // Uses balanced-paren extraction to handle nested modifiers correctly.
+            let searchFrom = 0;
+            for (const fn of ['register_code16', 'tap_code16']) {
+                let sfrom = 0;
+                while (true) {
+                    const r = extractBalancedArg(body, fn, sfrom);
+                    if (!r) break;
+                    const ast = Parser.parseMacroParam(r.arg, state, null);
+                    if (ast && ast.value !== 'none') bindings.push({ value: "&kp", params: [ensureLeaf(ast)] });
+                    sfrom = body.indexOf(fn + '(', sfrom) + fn.length + 1;
                 }
             }
             return bindings;

@@ -117,6 +117,18 @@ export const Constants = {
         "MYCM": "C_AL_MY_COMPUTER", "MY_COMPUTER": "C_AL_MY_COMPUTER",
         "MAIL": "C_AL_EMAIL",
         "NUHS": "NON_US_HASH", "NONUS_HASH": "NON_US_HASH", 
-        "NUBS": "NON_US_BSLH", "NONUS_BSLASH": "NON_US_BSLH"
+        "NUBS": "NON_US_BSLH", "NONUS_BSLASH": "NON_US_BSLH",
+
+        "KC_SYSTEM_SLEEP": "K_SLEEP", "SYSTEM_SLEEP": "K_SLEEP",
+        "KC_SYSTEM_POWER": "K_POWER", "SYSTEM_POWER": "K_POWER",
+        "KC_SYSTEM_WAKE":  "K_WAKE",  "SYSTEM_WAKE":  "K_WAKE",
+
+        "KC_MS_ACCEL0": "none", "MS_ACCEL0": "none",
+        "KC_MS_ACCEL1": "none", "MS_ACCEL1": "none",
+        "KC_MS_ACCEL2": "none", "MS_ACCEL2": "none",
+
+        "DM_REC1": "none", "DM_REC2": "none",
+        "DM_PLY1": "none", "DM_PLY2": "none",
+        "DM_RSTP": "none"
     }
 };
