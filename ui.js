@@ -407,7 +407,7 @@ export const UI = {
                         ${tapDanceCount > 0 ? `
                         <div class="p-4 bg-violet-50/40 border-b border-violet-100 text-[13px] text-violet-800 flex items-start gap-2">
                             <svg class="w-4 h-4 shrink-0 mt-0.5 text-violet-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                            <span>These tap-dances have been auto-migrated into the <strong>.tapDances[]</strong> array in your downloaded JSON. They will appear in the <strong>Tap-Dance</strong> tab of the MoErgo Layout Editor. Verify each binding looks correct before flashing.</span>
+                            <span>QMK tap-dances have been auto-migrated to the correct ZMK behavior type based on their branch structure: dances with a <strong>hold branch</strong> become custom <strong>.holdTaps[]</strong> entries, dances with a <strong>double-tap</strong> become <strong>.tapDances[]</strong> entries, and dances with a <strong>shifted double-tap</strong> become <strong>.modMorphs[]</strong>. Matrix keys are rewritten to reference the correct behavior automatically. Verify each binding in the MoErgo Layout Editor before flashing.</span>
                         </div>` : ''}
                         <table><tr><th>QMK Source</th><th>ZMK Tap-Dance</th><th>Decoded Bindings</th></tr>${buildTdRows(state.log.tap_dance)}</table>
                     </div>

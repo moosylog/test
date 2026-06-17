@@ -233,6 +233,10 @@ const Parser = {
         const context = { layer: layerIdx, pos: positionName, config: configInfo, color: keyColor };
         
         if (Constants.DEALBREAKER_KEYS.some(bad => tok.includes(bad))) {
+            // TD( tokens are handled by the post-layer rewrite pass — silence them here.
+            if (tok.startsWith('TD(') || tok.startsWith('DANCE_')) {
+                return { value: "&none" };
+            }
             Utils.logConversion(state, rawToken, "&none", "warning", Utils.getZmkSuggestion(rawToken), context);
             return { value: "&none" };
         }
@@ -587,160 +591,264 @@ self.onmessage = async function(e) {
 
         const generatedCombos = Parser.parseOryxCombos(cleanText, astLayers[0] || [], state, activeBoard);
 
-        // ── TAP-DANCE EXTRACTION ──────────────────────────────────────────────────
-        // Parse QMK tap-dance definitions into MoErgo .tapDances[] binding objects.
-        // QMK stores tap-dances in dance_*_finished functions; we already captured
-        // the raw C body in state.tapDances. Now we attempt to extract the tap and
-        // double-tap keycodes and emit a proper MoErgo tapDances schema entry.
+        // ── TAP-DANCE / MOD-MORPH / HOLD-TAP EXTRACTION ─────────────────────────
+        //
+        // STRATEGY (per MoErgo spec + learned examples):
+        //
+        // QMK tap-dances are procedural state machines with up to 5 branches:
+        //   SINGLE_TAP, SINGLE_HOLD, DOUBLE_TAP, DOUBLE_HOLD, DOUBLE_SINGLE_TAP
+        //
+        // ZMK / MoErgo cannot replicate this 1:1, but we map the most useful
+        // branches into the correct MoErgo schema object:
+        //
+        // ┌─────────────────────────────────────────────────────────────────────┐
+        // │ Has SINGLE_HOLD or DOUBLE_HOLD branch?                              │
+        // │   YES → emit a .holdTaps[] entry (custom hold-tap, tap-preferred)  │
+        // │          hold param = hold branch keycode (or DOUBLE_HOLD if both) │
+        // │          tap  param = SINGLE_TAP keycode                           │
+        // │          matrix binding = &ht_<name> with full nested AST params   │
+        // │                                                                     │
+        // │ Has DOUBLE_TAP branch but NO hold branch?                           │
+        // │   YES → emit a .tapDances[] entry (two &kp bindings)               │
+        // │          binding[0] = SINGLE_TAP, binding[1] = DOUBLE_TAP          │
+        // │                                                                     │
+        // │ SINGLE_TAP only (or only one resolvable keycode)?                   │
+        // │   → emit a simple &kp entry and note it in the tap_dance log        │
+        // │                                                                     │
+        // │ Mod-Morph: SINGLE_TAP = base key, shifted variant in any branch?   │
+        // │   YES → ALSO emit a .modMorphs[] entry alongside the above         │
+        // └─────────────────────────────────────────────────────────────────────┘
+        //
+        // All generated behaviors are registered in state.tdBehaviorMap so the
+        // matrix-rewrite pass (below) can replace TD(DANCE_N) nodes with the
+        // correct custom behavior reference and its pre-built params AST.
+
         const generatedTapDances = [];
-        const parseTapDanceKey = (block, fnName) => {
-            // Look for register_code16(KC_X) or tap_code16(KC_X) patterns inside
-            // if (dance_state[...].count == 1 ...) and count == 2 branches.
-            const codeRe = /(?:register_code16|tap_code16)\(\s*([A-Za-z0-9_()\s]+?)\s*\)/g;
-            const found = [];
-            let m;
-            while ((m = codeRe.exec(block)) !== null) {
-                let rawKey = m[1].trim();
-                let ast = Parser.parseMacroParam(rawKey, state, null);
-                if (ast && ast.value !== 'none') found.push(ast);
+        const generatedModMorphs = [];
+        const generatedHoldTapsFromTd = [];
+        // Map: rawName (DANCE_0) → { htName?, tdName?, matrixNode }
+        // matrixNode is the pre-built binding object to splice into .layers
+        state.tdBehaviorMap = {};
+
+        // ── Helper: extract all keycodes from a branch label in a switch block ──
+        // Returns raw QMK strings found after each `case <LABEL>:` line.
+        const extractBranchCodes = (block) => {
+            // Branch labels we care about
+            const branches = {
+                SINGLE_TAP: [],
+                SINGLE_HOLD: [],
+                DOUBLE_TAP: [],
+                DOUBLE_HOLD: [],
+            };
+            // Match: case LABEL: ... register_code16(X) / tap_code16(X) / layer_on(N)
+            const caseRe = /case\s+(SINGLE_TAP|SINGLE_HOLD|DOUBLE_TAP|DOUBLE_HOLD)[^:]*:([\s\S]*?)(?=case\s+(?:SINGLE_TAP|SINGLE_HOLD|DOUBLE_TAP|DOUBLE_HOLD|DOUBLE_SINGLE_TAP)|$)/g;
+            let cm;
+            while ((cm = caseRe.exec(block)) !== null) {
+                const label = cm[1];
+                const body  = cm[2];
+                // Collect register_code16 / tap_code16 args
+                const codeRe = /(?:register_code16|tap_code16)\(\s*([A-Za-z0-9_()\s]+?)\s*\)/g;
+                let mm;
+                while ((mm = codeRe.exec(body)) !== null) branches[label].push(mm[1].trim());
+                // Collect layer_on(N) args
+                const layerRe = /layer_on\(\s*(\d+)\s*\)/g;
+                while ((mm = layerRe.exec(body)) !== null) branches[label].push(`__LAYER_${mm[1]}`);
             }
-            return found;
+            return branches;
+        };
+
+        // ── Helper: build a leaf AST node (params:[]) from a raw keycode string ──
+        // Returns null if it can't be resolved.
+        const buildLeafAst = (rawKey, danceContext) => {
+            if (!rawKey) return null;
+            if (rawKey.startsWith('__LAYER_')) return { value: parseInt(rawKey.replace('__LAYER_', '')), params: [] };
+            const ast = Parser.parseMacroParam(rawKey, state, danceContext);
+            if (!ast || ast.value === 'none') return null;
+            // parseMacroParam already builds nested modifier trees when needed.
+            // We need to make sure leaf nodes carry params:[] per MoErgo spec.
+            const ensureLeaves = (node) => {
+                if (!node) return node;
+                if (!node.params || node.params.length === 0) node.params = [];
+                else node.params = node.params.map(ensureLeaves);
+                return node;
+            };
+            return ensureLeaves(ast);
+        };
+
+        // ── Helper: detect if a raw QMK string is a shifted-modifier wrap ──
+        // e.g. S(KC_X), LSFT(KC_X) → returns the inner keycode string or null
+        const getShiftedInner = (raw) => {
+            const m = raw.match(/^(?:S|LSFT|RSFT)\((.+)\)$/);
+            return m ? m[1].trim() : null;
         };
 
         for (const [rawName, rawBlock] of Object.entries(state.tapDances)) {
-            // rawName is like DANCE_0, DANCE_1 etc. (uppercased by the parser)
-            const keys = parseTapDanceKey(rawBlock, rawName);
-            if (keys.length >= 2) {
-                // Build MoErgo tapDance: two bindings (tap, double-tap)
-                const tapKey = keys[0];
-                const doubleTapKey = keys[1];
-                const tdName = `&td_${rawName.toLowerCase()}`;
+            const shortName = rawName.toLowerCase(); // e.g. dance_0
+            const branches  = extractBranchCodes(rawBlock);
+
+            const singleTapRaw  = branches.SINGLE_TAP[0]  || null;
+            const singleHoldRaw = branches.SINGLE_HOLD[0] || null;
+            const doubleTapRaw  = branches.DOUBLE_TAP[0]  || null;
+            const doubleHoldRaw = branches.DOUBLE_HOLD[0] || null;
+
+            const tapAst        = singleTapRaw  ? buildLeafAst(singleTapRaw,  null) : null;
+            const singleHoldAst = singleHoldRaw ? buildLeafAst(singleHoldRaw, null) : null;
+            const doubleTapAst  = doubleTapRaw  ? buildLeafAst(doubleTapRaw,  null) : null;
+            const doubleHoldAst = doubleHoldRaw ? buildLeafAst(doubleHoldRaw, null) : null;
+
+            // Prefer DOUBLE_HOLD as the hold action (richer behaviour), fall back to SINGLE_HOLD
+            const holdAst = doubleHoldAst || singleHoldAst;
+
+            // ── Detect mod-morph opportunity ──────────────────────────────────
+            // If DOUBLE_TAP is a shifted version of SINGLE_TAP we can make a mod-morph.
+            let mmEntry = null;
+            if (tapAst && doubleTapRaw) {
+                const innerRaw = getShiftedInner(doubleTapRaw);
+                if (innerRaw) {
+                    const morphAst = buildLeafAst(innerRaw, null);
+                    if (morphAst && morphAst.value !== 'none') {
+                        const mmName = `&mm_${shortName}`;
+                        mmEntry = {
+                            name: mmName,
+                            description: `Migrated from QMK: ${rawName} (base/shifted pair)`,
+                            cases: [
+                                { binding: { value: "&kp", params: [tapAst]    }, mods: [],                       keepMods: [] },
+                                { binding: { value: "&kp", params: [morphAst]  }, mods: ["MOD_LSFT","MOD_RSFT"], keepMods: [] }
+                            ]
+                        };
+                        generatedModMorphs.push(mmEntry);
+                        Utils.logConversion(state, rawName, mmName, 'mod_morph',
+                            `Base → ${tapAst.value}, Shifted morph → ${morphAst.value}`);
+                    }
+                }
+            }
+
+            // ── Route to correct MoErgo behavior type ─────────────────────────
+            if (holdAst) {
+                // ── CASE 1: Has a hold branch → emit a .holdTaps[] custom entry ──
+                // Hold param = hold keycode (or layer index integer).
+                // Tap  param = SINGLE_TAP keycode (or the mm entry if one was made).
+                const htName = `&ht_${shortName}`;
+
+                // Determine if the hold action targets a layer (layer_on)
+                const isLayerHold = singleHoldRaw?.startsWith('__LAYER_') || doubleHoldRaw?.startsWith('__LAYER_');
+
+                const htEntry = {
+                    name: htName,
+                    description: `Migrated from QMK: ${rawName}`,
+                    bindings: ["&kp", "&kp"],
+                    flavor: "tap-preferred",
+                    tappingTermMs: state.config.tappingTerm,
+                    quickTapMs: -1,
+                    requirePriorIdleMs: 125,
+                    holdTriggerOnRelease: false,
+                    holdTriggerKeyPositions: []
+                };
+
+                // If hold is a layer, switch to &lt-style (hold = &mo, tap = &kp)
+                if (isLayerHold) {
+                    htEntry.bindings = ["&mo", "&kp"];
+                    htEntry.description += " (Layer-Tap: hold activates layer)";
+                }
+
+                generatedHoldTapsFromTd.push(htEntry);
+
+                // Build the matrix binding node:
+                // { value: "&ht_X", params: [ holdParamAst, tapParamAst ] }
+                // Both are leaf-terminated per MoErgo spec.
+                const tapParam  = (mmEntry ? { value: mmEntry.name, params: [] } : tapAst) || { value: "none", params: [] };
+                const holdParam = holdAst;
+
+                const matrixNode = {
+                    value: htName,
+                    params: [ holdParam, tapParam ]
+                };
+
+                state.tdBehaviorMap[rawName] = { htName, matrixNode };
+                Utils.logConversion(state, rawName, htName, 'tap_dance',
+                    `Hold → ${holdParam.value ?? holdParam}, Tap → ${tapParam.value}`);
+
+            } else if (tapAst && doubleTapAst && !mmEntry) {
+                // ── CASE 2: No hold, has double-tap (and not a mod-morph) → .tapDances[] ──
+                const tdName = `&td_${shortName}`;
                 const tdEntry = {
                     name: tdName,
                     description: `Migrated from QMK: ${rawName}`,
                     tappingTermMs: state.config.tappingTerm,
                     bindings: [
-                        { value: "&kp", params: [tapKey] },
-                        { value: "&kp", params: [doubleTapKey] }
+                        { value: "&kp", params: [tapAst] },
+                        { value: "&kp", params: [doubleTapAst] }
                     ]
                 };
                 generatedTapDances.push(tdEntry);
+
+                const matrixNode = { value: tdName };
+                state.tdBehaviorMap[rawName] = { tdName, matrixNode };
                 Utils.logConversion(state, rawName, tdName, 'tap_dance',
-                    `Tap → ${tapKey.value}, Double-Tap → ${doubleTapKey.value}`);
-            } else if (keys.length === 1) {
-                // Only one keycode found — create a single-key tap-dance with trans
-                const tapKey = keys[0];
-                const tdName = `&td_${rawName.toLowerCase()}`;
-                const tdEntry = {
-                    name: tdName,
-                    description: `Migrated from QMK: ${rawName} (single-action only)`,
-                    tappingTermMs: state.config.tappingTerm,
-                    bindings: [
-                        { value: "&kp", params: [tapKey] },
-                        { value: "&trans" }
-                    ]
-                };
-                generatedTapDances.push(tdEntry);
-                Utils.logConversion(state, rawName, tdName, 'tap_dance',
-                    `Tap → ${tapKey.value}, Double-Tap → (none found, set to trans)`);
+                    `Tap → ${tapAst.value}, Double-Tap → ${doubleTapAst.value}`);
+
+            } else if (mmEntry) {
+                // ── CASE 3: Mod-morph only (no hold, double-tap was shifted variant) ──
+                // The matrix node just invokes the mod-morph directly.
+                const matrixNode = { value: mmEntry.name };
+                state.tdBehaviorMap[rawName] = { mmName: mmEntry.name, matrixNode };
+                Utils.logConversion(state, rawName, mmEntry.name, 'tap_dance',
+                    `Mod-Morph: base/shifted pair (no hold branch)`);
+
+            } else if (tapAst) {
+                // ── CASE 4: Single-tap only — degenerate tap-dance → plain &kp ──
+                const matrixNode = { value: "&kp", params: [tapAst] };
+                state.tdBehaviorMap[rawName] = { matrixNode };
+                Utils.logConversion(state, rawName, `&kp ${tapAst.value}`, 'tap_dance',
+                    `Single-tap only — simplified to plain &kp`);
+
             } else {
-                // Could not decode — log as warning so report shows it
+                // ── CASE 5: Could not decode anything → warning ──
                 Utils.logConversion(state, rawName, '&none', 'warning',
-                    'Could not decode tap-dance keycodes. Rebuild manually in MoErgo Tap-Dance editor.',
+                    'Could not decode tap-dance keycodes. Rebuild manually in the MoErgo editor.',
                     { layer: null, pos: 'Tap-Dance Definition', config: rawBlock, color: null });
+                state.tdBehaviorMap[rawName] = { matrixNode: { value: "&none" } };
             }
         }
 
-        // ── MOD-MORPH EXTRACTION ──────────────────────────────────────────────────
-        // Scan all generated AST layers for &kp bindings that use a shifted symbol
-        // modifier wrapper (e.g. LS(COMMA) meaning <). Emit a mod-morph so the
-        // MoErgo editor can represent "base key → shifted key" pairs natively.
+        // ── Rewrite TD(DANCE_N) nodes in every layer with the resolved behavior ──
+        // The AST layers were already built before this pass, with TD(DANCE_N)
+        // falling through to &none (DEALBREAKER). We now walk all layers and
+        // swap those &none placeholders by re-running translateAst-equivalent
+        // rewrites using our behavior map.
         //
-        // Strategy: collect unique (base_kp, shifted_kp) pairs seen in the matrix.
-        // For each unique pair we generate one &mm_ entry and rewrite the matrix
-        // node to reference it. This avoids duplicate entries.
-        const generatedModMorphs = [];
-        const mmIndex = new Map(); // key: "BASE|SHIFTED" → mm name
+        // Since translateAst already handled TD() tokens and returned &none,
+        // we instead do a second targeted pass: re-translate any raw token that
+        // starts with TD( against the original rawLayers token list, then splice
+        // the matrixNode in at the correct mapped index.
+        rawLayers.forEach((layerStr, layerIdx) => {
+            const tokens = Parser.splitQmkKeys(layerStr);
+            tokens.forEach((tok, keyIdx) => {
+                const clean = tok.trim();
+                // Match TD(DANCE_N) or TD(DANCE_N) with any casing
+                const tdMatch = clean.match(/^TD\(\s*([A-Za-z0-9_]+)\s*\)$/i);
+                if (!tdMatch) return;
+                const danceName = tdMatch[1].toUpperCase(); // e.g. DANCE_0
+                const entry = state.tdBehaviorMap[danceName];
+                if (!entry?.matrixNode) return;
 
-        const extractShiftedPair = (node) => {
-            // Detect pattern: { value:"&kp", params:[{ value:"LS", params:[{value:"X"}] }] }
-            if (node?.value !== '&kp') return null;
-            const p0 = node?.params?.[0];
-            if (!p0) return null;
-            if (p0.value === 'LS' || p0.value === 'RS') {
-                const inner = p0?.params?.[0];
-                if (inner && inner.value && inner.value !== 'none') {
-                    return { shifted: inner.value };
+                // Find the mapped target index for this keyIdx in this layer
+                let targetIdx = keyIdx;
+                if (activeBoard.name === "Voyager") {
+                    if      (keyIdx === 48) targetIdx = 50;
+                    else if (keyIdx === 49) targetIdx = 51;
+                    else if (keyIdx === 50) targetIdx = 54;
+                    else if (keyIdx === 51) targetIdx = 55;
+                    else if (keyIdx >= 52)  targetIdx = -1; // out of range
+                } else if (activeBoard.matrixMap) {
+                    targetIdx = activeBoard.matrixMap[keyIdx];
                 }
-            }
-            return null;
-        };
 
-        // Walk all layers to collect mod-morph candidates
-        astLayers.forEach(layer => {
-            layer.forEach(node => {
-                if (!node || node.value !== '&kp') return;
-                const shifted = extractShiftedPair(node);
-                if (!shifted) return;
-                // The "base" key is the unshifted counterpart. We can't know it from
-                // context alone without the original QMK token, so we skip auto-pairing
-                // here — mod-morphs require explicit base+morph context. We only emit
-                // them when translateAst produced a nested LS() binding flagged as
-                // "Nested Modifiers" in the log, which already handles these correctly
-                // as &kp LS(...). No additional mod-morph is auto-generated from matrix
-                // scan since we lack the base key. Instead we expose the collected
-                // mod-morph data the engineer manually added in the state.
+                if (targetIdx >= 0 && targetIdx < activeBoard.targetKeyCount) {
+                    astLayers[layerIdx][targetIdx] = entry.matrixNode;
+                }
             });
         });
-
-        // Expose any explicit mod-morph definitions the user pre-configured.
-        // (Future: parse QMK custom_keycodes that define shifted pairs.)
-        // For now, generate mod-morphs for any tap-dance that had a shifted variant:
-        // walk tapDances raw blocks for pairs like (KC_A, S(KC_B)) patterns.
-        const parseMmFromBlock = (block) => {
-            // Find pairs like: if (single tap) → key1, if (double tap) → S(key2)
-            // or simply first two codes where second is wrapped in S()/LSFT()
-            const codeRe = /(?:register_code16|tap_code16)\(\s*([A-Za-z0-9_()\s]+?)\s*\)/g;
-            const found = [];
-            let m;
-            while ((m = codeRe.exec(block)) !== null) found.push(m[1].trim());
-            if (found.length < 2) return null;
-            const baseStr = found[0], morphStr = found[1];
-            // Check if morph is a shifted variant
-            const shiftMatch = morphStr.match(/^(?:LSFT|S)\((.+)\)$/);
-            if (!shiftMatch) return null;
-            const baseAst = Parser.parseMacroParam(baseStr, state, null);
-            const morphAst = Parser.parseMacroParam(shiftMatch[1], state, null);
-            if (!baseAst || !morphAst || baseAst.value === 'none' || morphAst.value === 'none') return null;
-            return { base: baseAst, morph: morphAst };
-        };
-
-        for (const [rawName, rawBlock] of Object.entries(state.tapDances)) {
-            const pair = parseMmFromBlock(rawBlock);
-            if (!pair) continue;
-            const mmKey = `${pair.base.value}|${pair.morph.value}`;
-            if (mmIndex.has(mmKey)) continue; // deduplicate
-            const mmName = `&mm_${rawName.toLowerCase()}`;
-            mmIndex.set(mmKey, mmName);
-            generatedModMorphs.push({
-                name: mmName,
-                description: `Migrated from QMK tap-dance: ${rawName}`,
-                cases: [
-                    {
-                        binding: { value: "&kp", params: [pair.base] },
-                        mods: [],
-                        keepMods: []
-                    },
-                    {
-                        binding: { value: "&kp", params: [pair.morph] },
-                        mods: ["MOD_LSFT", "MOD_RSFT"],
-                        keepMods: []
-                    }
-                ]
-            });
-            Utils.logConversion(state, rawName, mmName, 'mod_morph',
-                `Base → ${pair.base.value}, Shifted morph → ${pair.morph.value}`);
-        }
 
         let templateJson;
         try {
@@ -796,17 +904,25 @@ self.onmessage = async function(e) {
             templateJson.tapDances = (templateJson.tapDances || []).concat(generatedTapDances);
         }
 
+        // Merge hold-taps generated from tap-dance branches (.holdTaps[])
+        if (generatedHoldTapsFromTd.length > 0) {
+            templateJson.holdTaps = (templateJson.holdTaps || []).concat(generatedHoldTapsFromTd);
+        }
+
         // Merge mod-morphs into the JSON (MoErgo schema: .modMorphs[])
         if (generatedModMorphs.length > 0) {
             templateJson.modMorphs = (templateJson.modMorphs || []).concat(generatedModMorphs);
         }
+
+        // Total "migrated" tap-dance behaviors = all three output types combined
+        const totalTdMigrated = generatedTapDances.length + generatedHoldTapsFromTd.length + generatedModMorphs.length;
 
         self.postMessage({ 
             success: true, 
             finalOutput: templateJson, 
             state, 
             layerCount: astLayers.length,
-            tapDanceCount: generatedTapDances.length,
+            tapDanceCount: totalTdMigrated,
             modMorphCount: generatedModMorphs.length,
             detectedBoard: activeBoard.name,
             targetBoard: activeBoard.targetBoard
