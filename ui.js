@@ -1,9 +1,85 @@
-import { getZmkSuggestion, getRebuildGuide } from './migration-guide.js';
-
 const MainUtils = {
     escapeHTML: (str) => {
         if (!str) return '';
         return String(str).replace(/[&<>'"]/g, match => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[match] || match));
+    },
+    
+    // Generic QMK Macro Parser
+    translateQMKMacro: (code) => {
+        if (!code) return "Rebuild as a Custom ZMK Macro.";
+        
+        // 1. Prevent "Double Content" by completely ignoring the boilerplate _reset functions!
+        let codeToParse = code;
+        if (codeToParse.includes('_reset')) {
+            codeToParse = codeToParse.split(/void\s+[a-zA-Z0-9_]+_reset/)[0];
+        }
+        
+        let htmlOutput = "";
+        let cleanCode = codeToParse.replace(/if\s*\(.*?\)\s*\{/g, '').replace(/\}/g, '').replace(/break;/g, '').replace(/case ST_MACRO_.*?:/g, '').trim();
+
+        const sendStringRegex = /SEND_STRING\(([\s\S]*?)\);/g;
+        let match;
+        let hasContent = false;
+
+        while ((match = sendStringRegex.exec(cleanCode)) !== null) {
+            hasContent = true;
+            let parsedStr = match[1];
+            
+            parsedStr = parsedStr.replace(/"([^"]+)"/g, ' [TYPE_STR:$1] ');
+
+            const mods = { 'SS_LCTL': 'Ctrl', 'SS_LSFT': 'Shift', 'SS_LALT': 'Alt', 'SS_LGUI': 'Cmd/Win', 'SS_RCTL': 'RCtrl', 'SS_RSFT': 'RShift', 'SS_RALT': 'RAlt', 'SS_RGUI': 'RCmd/Win' };
+            for (const [qmkMod, uiMod] of Object.entries(mods)) {
+                let modRegex = new RegExp(`${qmkMod}\\(([^)]+)\\)`, 'g');
+                parsedStr = parsedStr.replace(modRegex, `<strong class="text-slate-600 ml-1">${uiMod} +</strong> $1`);
+            }
+
+            parsedStr = parsedStr.replace(/SS_TAP\(X_([A-Z0-9_]+)\)/g, '[$1]');
+            parsedStr = parsedStr.replace(/SS_DOWN\(X_([A-Z0-9_]+)\)/g, 'Hold [$1]');
+            parsedStr = parsedStr.replace(/SS_UP\(X_([A-Z0-9_]+)\)/g, 'Release [$1]');
+            parsedStr = parsedStr.replace(/SS_DELAY\(([0-9]+)\)/g, ' [DELAY:$1] ');
+            parsedStr = parsedStr.replace(/X_([A-Z0-9_]+)/g, '[$1]'); 
+
+            parsedStr = parsedStr.replace(/\[TYPE_STR:([^\]]+)\]/g, '<span class="text-blue-600 font-bold text-[11px] whitespace-nowrap inline-block bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200 shadow-sm mx-1">Type "$1"</span>');
+            parsedStr = parsedStr.replace(/\[DELAY:([0-9]+)\]/g, '<span class="text-amber-600 font-bold text-[10px] bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 mx-1">⏱️ $1ms</span>');
+            parsedStr = parsedStr.replace(/\[([A-Z0-9_]+)\]/g, '<span class="keycap text-[10px] bg-white !border-slate-300 shadow-sm mx-0.5">$1</span>');
+
+            htmlOutput += `<div class="flex items-center flex-wrap gap-y-2 leading-relaxed mb-2">${parsedStr}</div>`;
+        }
+
+        // 2. We skip "unregister_code" so we don't spam the user with redundant release steps
+        const codeRegex = /(tap_code16|register_code16|tap_code|register_code)\((.*?)\);/g;
+        let tapSteps = [];
+        while ((match = codeRegex.exec(cleanCode)) !== null) {
+            hasContent = true;
+            let action = match[1];
+            let key = match[2].replace('KC_', '').replace('X_', '');
+            let htmlKey = `<span class="keycap text-[10px] bg-white !border-slate-300 shadow-sm mx-0.5">${key}</span>`;
+            
+            if (action.includes('tap')) tapSteps.push(`Tap ${htmlKey}`);
+            else if (action.includes('register')) tapSteps.push(`Hold ${htmlKey}`);
+        }
+        
+        // De-duplicate identical sequential steps to keep it perfectly clean
+        let uniqueSteps = [];
+        tapSteps.forEach(step => {
+            if (uniqueSteps[uniqueSteps.length - 1] !== step) {
+                uniqueSteps.push(step);
+            }
+        });
+
+        if (uniqueSteps.length > 0) {
+            htmlOutput += `<div class="flex items-center flex-wrap gap-2 mt-2">${uniqueSteps.join('<span class="text-slate-300 text-[10px]">➔</span>')}</div>`;
+        }
+
+        if (hasContent) {
+            return `
+                <strong class="block text-slate-800 text-xs mb-2">Decoded Sequence:</strong>
+                ${htmlOutput}
+                <p class="text-[11px] text-slate-500 mt-2 border-t border-slate-100 pt-2">Recreate this using the "Macro" tab in the MoErgo Editor.</p>
+            `;
+        }
+
+        return "Rebuild as a Custom ZMK Macro.";
     }
 };
 
@@ -73,37 +149,40 @@ export const UI = {
         }, 1000);
     },
 
-    buildReport: (layerCount, state) => {
+    buildReport: (layerCount, tapDanceCount, modMorphCount, state) => {
         const reportContainer = document.getElementById('outputReport');
         if (!reportContainer) return;
 
-const warnInstances = Object.values(state.log.warning || {}).reduce((a, c) => a + c.count, 0);
-
-// === SPLIT DUAL_FUNC FROM MACROS ===
-const realMacros = {};
-const dualFuncHoldTaps = {};
-
-Object.entries(state.macros || {}).forEach(([keyName, payload]) => {
-    if (payload && payload.includes('DUAL_FUNC')) {
-        dualFuncHoldTaps[keyName] = {
-            translated: "Hold-Tap",
-            reason: "Rebuild as a ZMK <strong>Hold-Tap</strong> Behavior in the MoErgo Layout Editor.",
-            count: 1,
-            config: payload
-        };
-    } else {
-        realMacros[keyName] = payload;
-    }
-});
-
-const macroCount = Object.keys(realMacros).length;
-const totalNeedsRebuild = warnInstances + macroCount + Object.keys(dualFuncHoldTaps).length;
-
+        const warnInstances = Object.values(state.log.warning || {}).reduce((a, c) => a + c.count, 0);
+        const macroCount = Object.keys(state.macros || {}).length;
+        const tdLogCount = Object.keys(state.log.tap_dance || {}).length;
+        const mmLogCount = Object.keys(state.log.mod_morph || {}).length;
+        const totalNeedsRebuild = warnInstances + macroCount;
 
         const stdInstances = Object.values(state.log.layer_binding || {}).reduce((a, c) => a + c.count, 0);
-        const htInstances = Object.values(state.log.hold_tap || {}).reduce((a, c) => a + c.count, 0) + Object.keys(dualFuncHoldTaps).length;
+        const htInstances = Object.values(state.log.hold_tap || {}).reduce((a, c) => a + c.count, 0);
         const comboInstances = Object.values(state.log.combo || {}).reduce((a, c) => a + c.count, 0);
         const totalMapped = stdInstances + htInstances + comboInstances;
+
+        const buildTdRows = (logCat) => {
+            if (Object.keys(logCat).length === 0) return `<tr><td colspan="3" class="empty-state">No tap-dances found.</td></tr>`;
+            return Object.entries(logCat).map(([original, data]) => `
+                <tr>
+                    <td class="code"><span class="keycap !border-slate-200 !shadow-none">${MainUtils.escapeHTML(original)}</span></td>
+                    <td class="code"><span class="keycap keycap-composite">${MainUtils.escapeHTML(data.translated)}</span></td>
+                    <td class="reason">${MainUtils.escapeHTML(data.reason || 'Migrated as ZMK Tap-Dance.')}</td>
+                </tr>`).join('');
+        };
+
+        const buildMmRows = (logCat) => {
+            if (Object.keys(logCat).length === 0) return `<tr><td colspan="3" class="empty-state">No mod-morphs found.</td></tr>`;
+            return Object.entries(logCat).map(([original, data]) => `
+                <tr>
+                    <td class="code"><span class="keycap !border-slate-200 !shadow-none">${MainUtils.escapeHTML(original)}</span></td>
+                    <td class="code"><span class="keycap keycap-composite">${MainUtils.escapeHTML(data.translated)}</span></td>
+                    <td class="reason">${MainUtils.escapeHTML(data.reason || 'Migrated as ZMK Mod-Morph.')}</td>
+                </tr>`).join('');
+        };
 
         const buildRows = (logCat) => {
             if (Object.keys(logCat).length === 0) return `<tr><td colspan="4" class="empty-state">🎉 Clean conversion!</td></tr>`;
@@ -148,18 +227,22 @@ const totalNeedsRebuild = warnInstances + macroCount + Object.keys(dualFuncHoldT
                     }
                 }
 
-let abstractionHTML = '';
-const rebuildGuideHtml = getRebuildGuide(original, foundConfig);
-if (rebuildGuideHtml) {
-    abstractionHTML = `
-        <div class="mb-4">
-            <div class="p-3 bg-indigo-50/40 border border-indigo-100 rounded-lg shadow-sm">
-                ${rebuildGuideHtml}
-            </div>
-        </div>
-    `;
-}
+                // Generate the Decoded Instructions
+                let abstractionHTML = '';
+                if (foundConfig) {
+                    let decoded = MainUtils.translateQMKMacro(foundConfig);
+                    if (decoded !== "Rebuild as a Custom ZMK Macro.") {
+                        abstractionHTML = `
+                            <div class="mb-4">
+                                <div class="p-3 bg-indigo-50/40 border border-indigo-100 rounded-lg shadow-sm">
+                                    ${decoded}
+                                </div>
+                            </div>
+                        `;
+                    }
+                }
 
+                // Cleanup the raw Config code so we don't show the duplicate _reset function
                 let configDisplay = '';
                 if (foundConfig) {
                     let displayConfig = foundConfig;
@@ -184,10 +267,10 @@ if (rebuildGuideHtml) {
                         <span class="bg-slate-100 text-slate-500 text-[11px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wider">${data.count} Instances</span>
                     </summary>
                     <div class="p-5 border-t border-slate-100 bg-slate-50/50 rounded-b-xl">
-<div class="mb-4">
-    <strong class="block text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">ZMK Replacement Suggestion</strong>
-    <p class="text-[13px] text-slate-800 font-medium leading-relaxed">${MainUtils.escapeHTML(data.reason)}</p>
-</div>
+                        <div class="mb-4">
+                            <strong class="block text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">ZMK Replacement Suggestion</strong>
+                            <p class="text-[13px] text-slate-800 font-medium leading-relaxed">${MainUtils.escapeHTML(data.reason)}</p>
+                        </div>
                         
                         ${abstractionHTML}
 
@@ -204,18 +287,18 @@ if (rebuildGuideHtml) {
             `}).join('') + `</div>`;
         };
 
-const macroRows = macroCount === 0 
-    ? `<tr><td colspan="3" class="empty-state">No custom macros found.</td></tr>`
-    : Object.entries(realMacros).map(([macName, payload]) => `
-        <tr>
-            <td class="code align-top pt-4"><span class="keycap">${MainUtils.escapeHTML(macName)}</span></td>
-            <td class="payload w-2/5 align-top pt-4">
-                <div class="bg-slate-900 rounded-lg p-3 max-h-32 overflow-y-auto shadow-inner">
-                    <pre class="bg-transparent p-0 m-0 text-slate-400 text-[10px] font-mono whitespace-pre-wrap">${MainUtils.escapeHTML(payload)}</pre>
-                </div>
-            </td>
-            <td class="reason align-top pt-4 pl-4">${payload && payload.includes('DUAL_FUNC') ? 'Moved to Hold-Taps section.' : (getRebuildGuide(macName, payload) || 'Rebuild as a ZMK <strong>Macro</strong> Behavior in the MoErgo Layout Editor.')}</td>
-        </tr>`).join('');
+        const macroRows = macroCount === 0 
+            ? `<tr><td colspan="3" class="empty-state">No custom macros found.</td></tr>`
+            : Object.entries(state.macros).map(([macName, payload]) => `
+                <tr>
+                    <td class="code align-top pt-4"><span class="keycap">${MainUtils.escapeHTML(macName)}</span></td>
+                    <td class="payload w-2/5 align-top pt-4">
+                        <div class="bg-slate-900 rounded-lg p-3 max-h-32 overflow-y-auto shadow-inner">
+                            <pre class="bg-transparent p-0 m-0 text-slate-400 text-[10px] font-mono whitespace-pre-wrap">${MainUtils.escapeHTML(payload)}</pre>
+                        </div>
+                    </td>
+                    <td class="reason align-top pt-4 pl-4">${MainUtils.translateQMKMacro(payload)}</td>
+                </tr>`).join('');
 
         reportContainer.innerHTML = `
             <div class="checklist-container">
@@ -246,9 +329,17 @@ const macroRows = macroCount === 0
                             <p class="text-[13px] text-slate-500 leading-relaxed max-w-xl">ZSA keeps layer names (like "Symbols" or "Nav") hidden in the cloud. Take a quick moment to re-label <em>Layer_0</em>, <em>Layer_1</em>, etc. inside the Layout Editor.</p>
                         </div>
                     </div>
+                    ${(tapDanceCount > 0 || modMorphCount > 0) ? `
+                    <div class="checklist-item bg-violet-50/20">
+                        <div class="step-circle" style="background:#ede9fe;color:#7c3aed;border-color:#c4b5fd;">${totalNeedsRebuild > 0 ? '4' : '4'}</div>
+                        <div class="mt-0.5">
+                            <strong class="text-slate-900 block text-[15px] mb-1">Verify your Tap-Dances & Mod-Morphs</strong>
+                            <p class="text-[13px] text-slate-500 leading-relaxed max-w-xl">We auto-migrated <strong>${tapDanceCount} tap-dance${tapDanceCount !== 1 ? 's' : ''}</strong>${modMorphCount > 0 ? ` and <strong>${modMorphCount} mod-morph${modMorphCount !== 1 ? 's' : ''}</strong>` : ''} into your JSON. Open the <strong>Tap-Dance</strong>${modMorphCount > 0 ? ' and <strong>Mod-Morph</strong>' : ''} tab${modMorphCount > 0 ? 's' : ''} in the MoErgo Layout Editor and confirm each binding looks correct before flashing.</p>
+                        </div>
+                    </div>` : ''}
                     ${totalNeedsRebuild > 0 ? `
                     <div class="checklist-item bg-orange-50/30">
-                        <div class="step-circle step-circle-warn">4</div>
+                        <div class="step-circle step-circle-warn">${(tapDanceCount > 0 || modMorphCount > 0) ? '5' : '4'}</div>
                         <div class="mt-0.5">
                             <strong class="text-slate-900 block text-[15px] mb-1">Rebuild your Advanced Features</strong>
                             <p class="text-[13px] text-slate-500 leading-relaxed max-w-xl">We noticed you had some custom macros or advanced ZSA features! We safely left those keys blank. Check the detailed summary below for exact code references and instructions on how to rebuild them in ZMK.</p>
@@ -264,9 +355,11 @@ const macroRows = macroCount === 0
                     <div class="h-px bg-slate-200 flex-grow"></div>
                 </div>
 
-                <div class="stat-grid">
+                <div class="stat-grid" style="grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));">
                     <div class="stat-box"><div class="stat-num text-blue-600">${layerCount}</div><div class="stat-label">Layers</div></div>
                     <div class="stat-box"><div class="stat-num">${totalMapped}</div><div class="stat-label">Keys Auto-Mapped</div></div>
+                    <div class="stat-box ${tapDanceCount > 0 ? '' : ''}"><div class="stat-num text-violet-600">${tapDanceCount}</div><div class="stat-label">Tap-Dances</div></div>
+                    <div class="stat-box ${modMorphCount > 0 ? '' : ''}"><div class="stat-num text-teal-600">${modMorphCount}</div><div class="stat-label">Mod-Morphs</div></div>
                     <div class="stat-box ${warnInstances > 0 ? 'warning' : ''}"><div class="stat-num">${warnInstances}</div><div class="stat-label">Actions Required</div></div>
                 </div>
                 
@@ -301,7 +394,39 @@ const macroRows = macroCount === 0
                         <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122"></path></svg>
                         Hold-Taps / Dual-Function <span class="ml-2 bg-slate-100 text-slate-500 border border-slate-200 px-2 py-0.5 rounded-md text-[10px] font-bold">${htInstances}</span>
                     </summary>
-                    <div class="cat-content"><table><tr><th>Original Key</th><th>MoErgo Target</th><th>Status</th><th class="text-center">Instances</th></tr>${buildRows({ ...state.log.hold_tap, ...dualFuncHoldTaps })}</table></div>
+                    <div class="cat-content"><table><tr><th>Original Key</th><th>MoErgo Target</th><th>Status</th><th class="text-center">Instances</th></tr>${buildRows(state.log.hold_tap)}</table></div>
+                </details>
+                
+                <details class="report-category">
+                    <summary>
+                        <svg class="w-5 h-5 text-violet-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 11.5V14m0-2.5v-6a1.5 1.5 0 113 0m-3 6a1.5 1.5 0 00-3 0v2a7.5 7.5 0 0015 0v-5a1.5 1.5 0 00-3 0m-6-3V11m0-5.5v-1a1.5 1.5 0 013 0v1m0 0V11m0-5.5a1.5 1.5 0 013 0v3m0 0V11"></path></svg>
+                        Tap-Dances <span class="ml-2 bg-slate-100 text-slate-500 border border-slate-200 px-2 py-0.5 rounded-md text-[10px] font-bold">${tapDanceCount}</span>
+                        ${tapDanceCount > 0 ? '<span class="ml-2 text-[10px] font-semibold text-violet-600 bg-violet-50 border border-violet-200 px-2 py-0.5 rounded-md">✓ Added to JSON</span>' : ''}
+                    </summary>
+                    <div class="cat-content">
+                        ${tapDanceCount > 0 ? `
+                        <div class="p-4 bg-violet-50/40 border-b border-violet-100 text-[13px] text-violet-800 flex items-start gap-2">
+                            <svg class="w-4 h-4 shrink-0 mt-0.5 text-violet-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            <span>These tap-dances have been auto-migrated into the <strong>.tapDances[]</strong> array in your downloaded JSON. They will appear in the <strong>Tap-Dance</strong> tab of the MoErgo Layout Editor. Verify each binding looks correct before flashing.</span>
+                        </div>` : ''}
+                        <table><tr><th>QMK Source</th><th>ZMK Tap-Dance</th><th>Decoded Bindings</th></tr>${buildTdRows(state.log.tap_dance)}</table>
+                    </div>
+                </details>
+
+                <details class="report-category">
+                    <summary>
+                        <svg class="w-5 h-5 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
+                        Mod-Morphs <span class="ml-2 bg-slate-100 text-slate-500 border border-slate-200 px-2 py-0.5 rounded-md text-[10px] font-bold">${modMorphCount}</span>
+                        ${modMorphCount > 0 ? '<span class="ml-2 text-[10px] font-semibold text-teal-600 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded-md">✓ Added to JSON</span>' : ''}
+                    </summary>
+                    <div class="cat-content">
+                        ${modMorphCount > 0 ? `
+                        <div class="p-4 bg-teal-50/40 border-b border-teal-100 text-[13px] text-teal-800 flex items-start gap-2">
+                            <svg class="w-4 h-4 shrink-0 mt-0.5 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            <span>These mod-morphs have been auto-migrated into the <strong>.modMorphs[]</strong> array in your downloaded JSON. They will appear in the <strong>Mod-Morph</strong> tab of the MoErgo Layout Editor. Each entry provides a base key and a shifted-modifier variant.</span>
+                        </div>` : ''}
+                        <table><tr><th>QMK Source</th><th>ZMK Mod-Morph</th><th>Base → Shifted Morph</th></tr>${buildMmRows(state.log.mod_morph)}</table>
+                    </div>
                 </details>
                 
                 <details class="report-category">

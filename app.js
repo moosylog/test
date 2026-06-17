@@ -59,7 +59,7 @@ export const App = {
     },
 
     handleWorkerResponse: (e) => {
-        const { success, finalOutput, state, layerCount, detectedBoard, targetBoard, error, stack } = e.data;
+        const { success, finalOutput, state, layerCount, tapDanceCount, modMorphCount, detectedBoard, targetBoard, error, stack } = e.data;
         
         if (!success) {
             UI.displayFatalError(error, stack);
@@ -78,7 +78,7 @@ export const App = {
         const outBox = document.getElementById('outputJson');
         if (outBox) outBox.value = JSON.stringify(finalOutput, null, 2);
         
-        UI.buildReport(layerCount, state);
+        UI.buildReport(layerCount, tapDanceCount || 0, modMorphCount || 0, state);
         window.scrollTo({ top: 0, behavior: 'smooth' });
     },
 

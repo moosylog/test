@@ -1,5 +1,4 @@
 import { Constants } from './constants.js';
-import { getZmkSuggestion } from './migration-guide.js';
 
 const Utils = {
     safeUUID: () => {
@@ -27,6 +26,18 @@ const Utils = {
         else { r = c; g = 0; b = x; }
         r = Math.round((r + m) * 255); g = Math.round((g + m) * 255); b = Math.round((b + m) * 255);
         return "#" + (1 << 24 | r << 16 | g << 8 | b).toString(16).slice(1) + "ff"; 
+    },
+    getZmkSuggestion: (tok) => {
+        if (!tok) return "Requires a custom ZMK Behavior.";
+        if (tok.includes('ALL_T')) return "ZMK does not natively support holding all modifiers. Build a custom macro.";
+        if (tok.includes('TD(') || tok.includes('DANCE_')) return "Rebuild using ZMK Tap-Dance (&td) or Mod-Morph (&morph).";
+        if (tok.includes('QK_LLCK')) return "Rebuild using ZMK Sticky Layer (&sl) or Toggle Layer (&tog).";
+        if (tok.includes('MAC_') || tok.includes('PC_')) return "Recreate as a custom ZMK Macro (&macro).";
+        if (tok.includes('NAVIGATOR') || tok.includes('MS_JIGGLER') || tok.includes('SCROLL') || tok.includes('MS_DBL_CLICK')) return "Requires native ZMK Mouse Keys bindings.";
+        if (tok.includes('LAYER_COLOR') || tok.includes('RGB') || tok.includes('HSV_')) return "Rebuild using ZMK RGB Underglow behaviors (&rgb_ug).";
+        if (tok.includes('LCTL(KC_MS') || tok.includes('LSFT(KC_MS')) return "ZMK cannot mix mouse clicks and keyboard modifiers on a single key. Rebuild as Macro.";
+        if (tok.startsWith('LM(')) return "ZMK does not natively support holding a Layer + Modifier simultaneously.";
+        return "Requires a custom ZMK Behavior or Macro setup.";
     },
     getSourcePosition: (idx) => {
         if (idx === null || idx === undefined) return "Unknown Matrix Position";
@@ -134,7 +145,7 @@ const Parser = {
                             let finalBinding = Parser.translateAst(resultKey, state, "Combo", null, null);
                             if (positions.length === comboDefs[comboName].length) {
                                 if (finalBinding?.value === "&none" || finalBinding?.value === "none") {
-                                    Utils.logConversion(state, `COMBO(${comboName})`, "Dropped", "warning", getZmkSuggestion(resultKey));
+                                    Utils.logConversion(state, `COMBO(${comboName})`, "Dropped", "warning", Utils.getZmkSuggestion(resultKey));
                                 } else {
                                     combos.push({
                                         name: comboName, description: `Migrated combo: ${comboName}`,
@@ -173,10 +184,10 @@ const Parser = {
         if (clean === "none" || clean === "trans" || clean === 'QK_BOOT' || clean === 'CW_TOGG') return clean;
         if (clean.startsWith('RGB_')) return clean;
         if (clean.startsWith('STN_') || clean.startsWith('QK_STENO') || clean.startsWith('DM_') || clean.startsWith('HSV_') || clean === 'LED_LEVEL') {
-            Utils.logConversion(state, rawToken || str, "&none", "warning", getZmkSuggestion(rawToken || str), context);
+            Utils.logConversion(state, rawToken || str, "&none", "warning", Utils.getZmkSuggestion(rawToken || str), context);
             return "none";
         }
-        Utils.logConversion(state, rawToken || str, "&none", "warning", getZmkSuggestion(rawToken || str), context);
+        Utils.logConversion(state, rawToken || str, "&none", "warning", Utils.getZmkSuggestion(rawToken || str), context);
         return "none";
     },
 
@@ -189,7 +200,7 @@ const Parser = {
         if (str === 'MOD_MEH' || str === 'KC_MEH' || str === 'MEH') str = 'LS(LC(LALT))';
         
         if (Constants.DEALBREAKER_KEYS.some(bad => str.includes(bad))) {
-            Utils.logConversion(state, str, "&none", "warning", getZmkSuggestion(str), context);
+            Utils.logConversion(state, str, "&none", "warning", Utils.getZmkSuggestion(str), context);
             return { value: "none" }; 
         }
 
@@ -204,7 +215,7 @@ const Parser = {
         
         let resolved = Parser.resolveZmkKeycode(str, str, state, context);
         if (['LCLK', 'RCLK', 'MCLK', 'MB4', 'MB5', 'MOVE_UP', 'MOVE_DOWN', 'MOVE_LEFT', 'MOVE_RIGHT', 'SCRL_UP', 'SCRL_DOWN', 'SCRL_LEFT', 'SCRL_RIGHT'].includes(resolved)) {
-            Utils.logConversion(state, str, "&none", "warning", getZmkSuggestion(str), context);
+            Utils.logConversion(state, str, "&none", "warning", Utils.getZmkSuggestion(str), context);
             return { value: "none" };
         }
         return { value: resolved };
@@ -222,7 +233,7 @@ const Parser = {
         const context = { layer: layerIdx, pos: positionName, config: configInfo, color: keyColor };
         
         if (Constants.DEALBREAKER_KEYS.some(bad => tok.includes(bad))) {
-            Utils.logConversion(state, rawToken, "&none", "warning", getZmkSuggestion(rawToken), context);
+            Utils.logConversion(state, rawToken, "&none", "warning", Utils.getZmkSuggestion(rawToken), context);
             return { value: "&none" };
         }
 
@@ -443,7 +454,7 @@ self.onmessage = async function(e) {
     try {
         if (!rawText) throw new Error("No source code text provided to the parser.");
 
-        const state = { log: { layer_binding: {}, hold_tap: {}, combo: {}, warning: {} }, macros: {}, tapDances: {}, rawDefines: {}, customCases: {}, config: { tappingTerm: 200, comboTerm: 50 }, defines: {} };
+        const state = { log: { layer_binding: {}, hold_tap: {}, combo: {}, warning: {}, tap_dance: {}, mod_morph: {} }, macros: {}, tapDances: {}, rawDefines: {}, customCases: {}, config: { tappingTerm: 200, comboTerm: 50 }, defines: {} };
         const cleanText = Parser.prepareCCode(rawText);
 
         let activeBoard = null, layoutMacroName = null;
@@ -554,19 +565,13 @@ self.onmessage = async function(e) {
                 
                 let targetIdx = i;
 
-if (activeBoard.name === "Voyager") {
-                    // Map Voyager 52-key matrix to Go60 60-key matrix
-                    if (i < 48) {
-                        targetIdx = i;
-                    } else if (i === 48) {
-                        targetIdx = 54; // Left Inner Thumb
-                    } else if (i === 49) {
-                        targetIdx = 55; // Left Outer Thumb
-                    } else if (i === 50) {
-                        targetIdx = 58; // Right Inner Thumb
-                    } else if (i === 51) {
-                        targetIdx = 59; // Right Outer Thumb
-                    }
+                if (activeBoard.name === "Voyager") {
+                    // Safe Go60 padding logic explicitly retained!
+                    if (i < 48) targetIdx = i;
+                    else if (i === 48) targetIdx = 50; 
+                    else if (i === 49) targetIdx = 51;
+                    else if (i === 50) targetIdx = 54;
+                    else if (i === 51) targetIdx = 55;
                 } else if (activeBoard.matrixMap) {
                     // Pull the exact, explicit mapping index
                     targetIdx = activeBoard.matrixMap[i];
@@ -581,6 +586,161 @@ if (activeBoard.name === "Voyager") {
         });
 
         const generatedCombos = Parser.parseOryxCombos(cleanText, astLayers[0] || [], state, activeBoard);
+
+        // ── TAP-DANCE EXTRACTION ──────────────────────────────────────────────────
+        // Parse QMK tap-dance definitions into MoErgo .tapDances[] binding objects.
+        // QMK stores tap-dances in dance_*_finished functions; we already captured
+        // the raw C body in state.tapDances. Now we attempt to extract the tap and
+        // double-tap keycodes and emit a proper MoErgo tapDances schema entry.
+        const generatedTapDances = [];
+        const parseTapDanceKey = (block, fnName) => {
+            // Look for register_code16(KC_X) or tap_code16(KC_X) patterns inside
+            // if (dance_state[...].count == 1 ...) and count == 2 branches.
+            const codeRe = /(?:register_code16|tap_code16)\(\s*([A-Za-z0-9_()\s]+?)\s*\)/g;
+            const found = [];
+            let m;
+            while ((m = codeRe.exec(block)) !== null) {
+                let rawKey = m[1].trim();
+                let ast = Parser.parseMacroParam(rawKey, state, null);
+                if (ast && ast.value !== 'none') found.push(ast);
+            }
+            return found;
+        };
+
+        for (const [rawName, rawBlock] of Object.entries(state.tapDances)) {
+            // rawName is like DANCE_0, DANCE_1 etc. (uppercased by the parser)
+            const keys = parseTapDanceKey(rawBlock, rawName);
+            if (keys.length >= 2) {
+                // Build MoErgo tapDance: two bindings (tap, double-tap)
+                const tapKey = keys[0];
+                const doubleTapKey = keys[1];
+                const tdName = `&td_${rawName.toLowerCase()}`;
+                const tdEntry = {
+                    name: tdName,
+                    description: `Migrated from QMK: ${rawName}`,
+                    tappingTermMs: state.config.tappingTerm,
+                    bindings: [
+                        { value: "&kp", params: [tapKey] },
+                        { value: "&kp", params: [doubleTapKey] }
+                    ]
+                };
+                generatedTapDances.push(tdEntry);
+                Utils.logConversion(state, rawName, tdName, 'tap_dance',
+                    `Tap → ${tapKey.value}, Double-Tap → ${doubleTapKey.value}`);
+            } else if (keys.length === 1) {
+                // Only one keycode found — create a single-key tap-dance with trans
+                const tapKey = keys[0];
+                const tdName = `&td_${rawName.toLowerCase()}`;
+                const tdEntry = {
+                    name: tdName,
+                    description: `Migrated from QMK: ${rawName} (single-action only)`,
+                    tappingTermMs: state.config.tappingTerm,
+                    bindings: [
+                        { value: "&kp", params: [tapKey] },
+                        { value: "&trans" }
+                    ]
+                };
+                generatedTapDances.push(tdEntry);
+                Utils.logConversion(state, rawName, tdName, 'tap_dance',
+                    `Tap → ${tapKey.value}, Double-Tap → (none found, set to trans)`);
+            } else {
+                // Could not decode — log as warning so report shows it
+                Utils.logConversion(state, rawName, '&none', 'warning',
+                    'Could not decode tap-dance keycodes. Rebuild manually in MoErgo Tap-Dance editor.',
+                    { layer: null, pos: 'Tap-Dance Definition', config: rawBlock, color: null });
+            }
+        }
+
+        // ── MOD-MORPH EXTRACTION ──────────────────────────────────────────────────
+        // Scan all generated AST layers for &kp bindings that use a shifted symbol
+        // modifier wrapper (e.g. LS(COMMA) meaning <). Emit a mod-morph so the
+        // MoErgo editor can represent "base key → shifted key" pairs natively.
+        //
+        // Strategy: collect unique (base_kp, shifted_kp) pairs seen in the matrix.
+        // For each unique pair we generate one &mm_ entry and rewrite the matrix
+        // node to reference it. This avoids duplicate entries.
+        const generatedModMorphs = [];
+        const mmIndex = new Map(); // key: "BASE|SHIFTED" → mm name
+
+        const extractShiftedPair = (node) => {
+            // Detect pattern: { value:"&kp", params:[{ value:"LS", params:[{value:"X"}] }] }
+            if (node?.value !== '&kp') return null;
+            const p0 = node?.params?.[0];
+            if (!p0) return null;
+            if (p0.value === 'LS' || p0.value === 'RS') {
+                const inner = p0?.params?.[0];
+                if (inner && inner.value && inner.value !== 'none') {
+                    return { shifted: inner.value };
+                }
+            }
+            return null;
+        };
+
+        // Walk all layers to collect mod-morph candidates
+        astLayers.forEach(layer => {
+            layer.forEach(node => {
+                if (!node || node.value !== '&kp') return;
+                const shifted = extractShiftedPair(node);
+                if (!shifted) return;
+                // The "base" key is the unshifted counterpart. We can't know it from
+                // context alone without the original QMK token, so we skip auto-pairing
+                // here — mod-morphs require explicit base+morph context. We only emit
+                // them when translateAst produced a nested LS() binding flagged as
+                // "Nested Modifiers" in the log, which already handles these correctly
+                // as &kp LS(...). No additional mod-morph is auto-generated from matrix
+                // scan since we lack the base key. Instead we expose the collected
+                // mod-morph data the engineer manually added in the state.
+            });
+        });
+
+        // Expose any explicit mod-morph definitions the user pre-configured.
+        // (Future: parse QMK custom_keycodes that define shifted pairs.)
+        // For now, generate mod-morphs for any tap-dance that had a shifted variant:
+        // walk tapDances raw blocks for pairs like (KC_A, S(KC_B)) patterns.
+        const parseMmFromBlock = (block) => {
+            // Find pairs like: if (single tap) → key1, if (double tap) → S(key2)
+            // or simply first two codes where second is wrapped in S()/LSFT()
+            const codeRe = /(?:register_code16|tap_code16)\(\s*([A-Za-z0-9_()\s]+?)\s*\)/g;
+            const found = [];
+            let m;
+            while ((m = codeRe.exec(block)) !== null) found.push(m[1].trim());
+            if (found.length < 2) return null;
+            const baseStr = found[0], morphStr = found[1];
+            // Check if morph is a shifted variant
+            const shiftMatch = morphStr.match(/^(?:LSFT|S)\((.+)\)$/);
+            if (!shiftMatch) return null;
+            const baseAst = Parser.parseMacroParam(baseStr, state, null);
+            const morphAst = Parser.parseMacroParam(shiftMatch[1], state, null);
+            if (!baseAst || !morphAst || baseAst.value === 'none' || morphAst.value === 'none') return null;
+            return { base: baseAst, morph: morphAst };
+        };
+
+        for (const [rawName, rawBlock] of Object.entries(state.tapDances)) {
+            const pair = parseMmFromBlock(rawBlock);
+            if (!pair) continue;
+            const mmKey = `${pair.base.value}|${pair.morph.value}`;
+            if (mmIndex.has(mmKey)) continue; // deduplicate
+            const mmName = `&mm_${rawName.toLowerCase()}`;
+            mmIndex.set(mmKey, mmName);
+            generatedModMorphs.push({
+                name: mmName,
+                description: `Migrated from QMK tap-dance: ${rawName}`,
+                cases: [
+                    {
+                        binding: { value: "&kp", params: [pair.base] },
+                        mods: [],
+                        keepMods: []
+                    },
+                    {
+                        binding: { value: "&kp", params: [pair.morph] },
+                        mods: ["MOD_LSFT", "MOD_RSFT"],
+                        keepMods: []
+                    }
+                ]
+            });
+            Utils.logConversion(state, rawName, mmName, 'mod_morph',
+                `Base → ${pair.base.value}, Shifted morph → ${pair.morph.value}`);
+        }
 
         let templateJson;
         try {
@@ -631,11 +791,23 @@ if (activeBoard.name === "Voyager") {
         templateJson.layer_names = (templateJson.layer_names || []).concat(astLayers.map((_, i) => `OMA_${activeBoard.name}_${i}`));
         templateJson.combos = (templateJson.combos || []).concat(generatedCombos);
 
+        // Merge tap-dances into the JSON (MoErgo schema: .tapDances[])
+        if (generatedTapDances.length > 0) {
+            templateJson.tapDances = (templateJson.tapDances || []).concat(generatedTapDances);
+        }
+
+        // Merge mod-morphs into the JSON (MoErgo schema: .modMorphs[])
+        if (generatedModMorphs.length > 0) {
+            templateJson.modMorphs = (templateJson.modMorphs || []).concat(generatedModMorphs);
+        }
+
         self.postMessage({ 
             success: true, 
             finalOutput: templateJson, 
             state, 
             layerCount: astLayers.length,
+            tapDanceCount: generatedTapDances.length,
+            modMorphCount: generatedModMorphs.length,
             detectedBoard: activeBoard.name,
             targetBoard: activeBoard.targetBoard
         });
